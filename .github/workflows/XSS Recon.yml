@@ -1,0 +1,173 @@
+# xss-scan.yml
+# Ultimate XSS-focused scan workflow
+# WARNING: Run this ONLY on domains you own or have explicit permission to test.
+
+name: XSS Recon & Scan (dalfox + archives)
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Target domain (example.com)'
+        required: true
+        default: 'example.com'
+      use_wayback:
+        description: 'Include Wayback/Gau results? (true/false)'
+        required: false
+        default: 'true'
+      enable_dalfox:
+        description: 'Run dalfox active scan on collected URLs? (true/false)'
+        required: false
+        default: 'true'
+      concurrency:
+        description: 'Probe concurrency (httpx/other)'
+        required: false
+        default: '20'
+
+jobs:
+  xss-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      DEFAULT_DOMAIN: example.com
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Discord webhook secret
+        run: |
+          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "::error::DISCORD_WEBHOOK secret is not set"
+            exit 1
+          fi
+          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y git curl jq python3 python3-pip build-essential || true
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install tooling (subfinder, assetfinder, httpx, gau, waybackurls, dalfox)
+        run: |
+          export PATH=$PATH:$HOME/go/bin:$HOME/.local/bin
+          /usr/bin/env bash -lc "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest" || true
+          /usr/bin/env bash -lc "go install -v github.com/tomnomnom/assetfinder@latest" || true
+          /usr/bin/env bash -lc "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest" || true
+          /usr/bin/env bash -lc "go install -v github.com/lc/gau/v2/cmd/gau@latest" || true
+          /usr/bin/env bash -lc "go install -v github.com/tomnomnom/waybackurls@latest" || true
+          # dalfox v2
+          /usr/bin/env bash -lc "go install -v github.com/hahwul/dalfox/v2@latest" || true
+          # make sure pip installed helpers if needed
+          python3 -m pip install --user broofa || true
+
+      - name: Set inputs
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
+            echo "USE_WAYBACK=${{ github.event.inputs.use_wayback }}" >> $GITHUB_ENV
+            echo "ENABLE_DALFOX=${{ github.event.inputs.enable_dalfox }}" >> $GITHUB_ENV
+            echo "CONC=${{ github.event.inputs.concurrency }}" >> $GITHUB_ENV
+          else
+            echo "DOMAIN=${{ env.DEFAULT_DOMAIN }}" >> $GITHUB_ENV
+            echo "USE_WAYBACK=true" >> $GITHUB_ENV
+            echo "ENABLE_DALFOX=true" >> $GITHUB_ENV
+            echo "CONC=20" >> $GITHUB_ENV
+          fi
+
+      - name: Notify start (Discord)
+        run: |
+          curl -s -X POST -H "Content-Type: application/json" \
+            -d "{\"content\":\"🔎 **XSS Scan started**\\n**Domain:** ${{ env.DOMAIN }}\\n**Tools:** subfinder, assetfinder, gau/waybackurls, httpx, dalfox\"}" \
+            "${{ env.DISCORD_WEBHOOK }}"
+
+      - name: Create output dirs
+        run: |
+          mkdir -p scan-output
+          cd scan-output
+          mkdir -p raw urls_with_params dalfox_results
+          cd ..
+
+      - name: Passive subdomain enumeration
+        run: |
+          DOMAIN="${{ env.DOMAIN }}"
+          subfinder -d "$DOMAIN" -silent -o scan-output/raw/subfinder.txt || true
+          assetfinder --subs-only "$DOMAIN" > scan-output/raw/assetfinder.txt || true
+          curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' | tr ',' '\n' > scan-output/raw/crtsh.txt || true
+          cat scan-output/raw/*.txt | sed '/^\s*$/d' | sort -u > scan-output/raw/passive_subs.txt || true
+
+      - name: Collect URLs from archives (gau + waybackurls) [optional]
+        run: |
+          DOMAIN="${{ env.DOMAIN }}"
+          if [ "${{ env.USE_WAYBACK }}" = "true" ]; then
+            cat scan-output/raw/passive_subs.txt | while read -r sub; do
+              [ -z "$sub" ] && continue
+              /usr/bin/env bash -lc "echo $sub | gau -subs --blacklist png,jpg,svg,css,woff,woff2,ico >> scan-output/raw/gau_urls.txt || true"
+              /usr/bin/env bash -lc "echo $sub | waybackurls >> scan-output/raw/wayback_urls.txt || true"
+            done
+          fi
+          # normalize
+          cat scan-output/raw/gau_urls.txt scan-output/raw/wayback_urls.txt 2>/dev/null | sed '/^\s*$/d' | sort -u > scan-output/raw/archive_urls.txt || true
+
+      - name: Probe live URLs (httpx) and gather URLs containing query params
+        run: |
+          # Combine sources: archive URLs + simple host root probes
+          cat scan-output/raw/archive_urls.txt 2>/dev/null > scan-output/raw/all_candidate_urls.txt || true
+          # probe the passive subdomains for homepage URLs (so httpx can expand)
+          if [ -s scan-output/raw/passive_subs.txt ]; then
+            httpx -l scan-output/raw/passive_subs.txt -silent -threads "${{ env.CONC }}" -status-code -o scan-output/raw/httpx_root.txt || true
+            awk '{print $1}' scan-output/raw/httpx_root.txt | sed 's|https\?://||' | sed 's/:[0-9]*$//' | sort -u | while read -r host; do
+              # request root to collect any redirects/links - use httpx with -location to follow
+              httpx -silent -u "http://$host" -location -o /dev/null || true
+            done
+          fi
+          # Probe archive urls and filter those that contain '?'
+          if [ -s scan-output/raw/all_candidate_urls.txt ]; then
+            httpx -silent -mc 200 -threads "${{ env.CONC }}" -l scan-output/raw/all_candidate_urls.txt -o scan-output/raw/httpx_urls.txt || true
+            # keep URLs that contain query parameters (candidates for XSS)
+            grep -E '\?.+=' scan-output/raw/httpx_urls.txt | sort -u > scan-output/urls_with_params/urls_candidate_params.txt || true
+          fi
+          # Additionally, collect query-containing URLs from the archive raw files directly
+          grep -E '\?.+=' scan-output/raw/archive_urls.txt 2>/dev/null | sort -u >> scan-output/urls_with_params/urls_candidate_params.txt || true
+          sort -u scan-output/urls_with_params/urls_candidate_params.txt -o scan-output/urls_with_params/urls_candidate_params.txt || true
+          echo "CAND_COUNT=$(wc -l < scan-output/urls_with_params/urls_candidate_params.txt || echo 0)" >> $GITHUB_ENV
+          curl -s -X POST -H "Content-Type: application/json" -d "{\"content\":\"🧭 URL candidates with params: ${{ env.CAND_COUNT }}\"}" "${{ env.DISCORD_WEBHOOK }}"
+
+      - name: Run dalfox on parameterized URLs (active XSS scan)
+        if: env.ENABLE_DALFOX == 'true'
+        run: |
+          if ! command -v dalfox >/dev/null 2>&1; then
+            echo "::warning::dalfox not installed - skipping dalfox stage"
+            exit 0
+          fi
+          # run dalfox in passive+active mode by file; limit concurrency/threads
+          # -b (blind/xss) and silent flags adjusted for CI; tune flags as needed
+          dalfox file scan-output/urls_with_params/urls_candidate_params.txt -T "${{ env.CONC }}" -o scan-output/dalfox_results/dalfox-results.txt || true
+          echo "DALFOX_FOUND=$(wc -l < scan-output/dalfox_results/dalfox-results.txt || echo 0)" >> $GITHUB_ENV
+          # send short summary to Discord (avoid leaking payloads in public)
+          if [ "${{ env.DALFOX_FOUND:-}" != "" ] && [ "${{ env.DALFOX_FOUND }}" -gt 0 ]; then
+            curl -s -X POST -H "Content-Type: application/json" -d "{\"content\":\"🚨 dalfox found potential XSS candidates: ${{ env.DALFOX_FOUND }} (see artifacts)\"}" \"${{ env.DISCORD_WEBHOOK }}\"
+          else
+            curl -s -X POST -H "Content-Type: application/json" -d "{\"content\":\"✅ dalfox: no obvious XSS results for ${{ env.DOMAIN }} or results are 0.\"}" \"${{ env.DISCORD_WEBHOOK }}\"
+          fi
+
+      - name: Upload artifacts (results & raw)
+        uses: actions/upload-artifact@v4
+        with:
+          name: xss-scan-${{ env.DOMAIN }}-${{ github.run_id }}
+          path: |
+            scan-output/raw/*
+            scan-output/urls_with_params/*
+            scan-output/dalfox_results/*
+
+      - name: Final summary
+        run: |
+          SUMMARY="✅ XSS scan finished\nDomain: ${{ env.DOMAIN }}\nURL candidates: ${{ env.CAND_COUNT }}\nDalfox findings: ${{ env.DALFOX_FOUND:-0 }}"
+          curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": $(echo \"$SUMMARY\" | jq -Rs .)}" "${{ env.DISCORD_WEBHOOK }}"
