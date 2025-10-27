@@ -1,7 +1,3 @@
-# xss-scan.yml
-# Ultimate XSS-focused scan workflow
-# WARNING: Run this ONLY on domains you own or have explicit permission to test.
-
 name: XSS Recon & Scan (dalfox + archives)
 
 on:
