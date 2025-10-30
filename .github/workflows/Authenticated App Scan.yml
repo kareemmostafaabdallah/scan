@@ -1,0 +1,60 @@
+name: Authenticated App Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Target domain (example.com)'
+        required: true
+        default: 'example.com'
+
+jobs:
+  auth-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate secrets
+        run: |
+          if [ -z "${{ secrets.APP_LOGIN_URL }}" ] || [ -z "${{ secrets.APP_USERNAME }}" ] || [ -z "${{ secrets.APP_PASSWORD }}" ] || [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "::error::Set APP_LOGIN_URL, APP_USERNAME, APP_PASSWORD and DISCORD_WEBHOOK secrets"
+            exit 1
+          fi
+          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y python3-pip jq curl || true
+          python3 -m pip install --user requests selenium || true
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Acquire session (example script)
+        run: |
+          mkdir -p auth-output
+          python3 - <<'PY'
+import os,requests,sys
+login_url=os.environ['APP_LOGIN_URL']
+user=os.environ['APP_USERNAME']
+pw=os.environ['APP_PASSWORD']
+s=requests.Session()
+r=s.post(login_url, data={'username':user,'password':pw}, allow_redirects=True, timeout=20)
+print('LOGIN_STATUS', r.status_code)
+open('auth-output/auth_cookies.txt','w').write(str(s.cookies.get_dict()))
+PY
+
+      - name: Authenticated crawl + simple checks
+        run: |
+          # placeholder: use saved cookies to crawl authenticated pages, then run nuclei/zap as needed
+          echo "Authenticated session saved in auth-output/auth_cookies.txt" > auth-output/result.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-scan-${{ github.run_id }}
+          path: auth-output
+
+      - name: Notify
+        run: |
+          curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": \"✅ Authenticated scan finished (check artifacts)\"}" "${{ secrets.DISCORD_WEBHOOK }}"
