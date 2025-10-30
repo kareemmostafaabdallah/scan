@@ -1,0 +1,212 @@
+name: Path Discovery (ffuf + httpx) - Fast & Reliable
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Target domain (example.com or https://example.com)'
+        required: true
+        default: 'example.com'
+      wordlist_url:
+        description: 'Raw wordlist URL (defaults to SecLists raft-small)'
+        required: false
+        default: 'https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-small-words.txt'
+      extensions:
+        description: 'Comma separated extensions to append (e.g.: php,html,txt) - leave empty for none'
+        required: false
+        default: ''
+      threads:
+        description: 'ffuf concurrency/threads'
+        required: false
+        default: '40'
+      follow_redirects:
+        description: 'Follow redirects in ffuf (true/false)'
+        required: false
+        default: 'false'
+      status_codes:
+        description: 'Include only these status codes (comma separated) - empty to include all'
+        required: false
+        default: ''
+      timeout:
+        description: 'Request timeout seconds for ffuf/httpx'
+        required: false
+        default: '10'
+
+jobs:
+  path-discovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate optional Discord webhook secret
+        run: |
+          if [ -n "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
+          fi
+
+      - name: Install system deps & Go
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl git build-essential python3 python3-pip wget unzip || true
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install tools (ffuf, httpx, gau)
+        run: |
+          export PATH=$PATH:$HOME/go/bin:$HOME/.local/bin
+          # ffuf
+          /usr/bin/env bash -lc "go install github.com/ffuf/ffuf@latest" || true
+          # httpx for fast probing
+          /usr/bin/env bash -lc "go install github.com/projectdiscovery/httpx/cmd/httpx@latest" || true
+          # gau (optional) to gather known paths from archives
+          /usr/bin/env bash -lc "go install github.com/lc/gau/v2/cmd/gau@latest" || true
+          mkdir -p path-discovery-output wordlists
+
+      - name: Prepare inputs (env)
+        run: |
+          # Normalize domain input
+          RAW="${{ github.event.inputs.domain }}"
+          if echo "$RAW" | grep -qE '^https?://'; then
+            HOST=$(echo "$RAW" | sed -E 's#^https?://##' | sed -E 's#/$##')
+            echo "TARGET_URL=https://$HOST" >> $GITHUB_ENV
+            echo "TARGET_HOST=$HOST" >> $GITHUB_ENV
+          else
+            HOST="$RAW"
+            echo "TARGET_URL=https://$HOST" >> $GITHUB_ENV
+            echo "TARGET_HOST=$HOST" >> $GITHUB_ENV
+          fi
+          echo "FFUF_THREADS=${{ github.event.inputs.threads }}" >> $GITHUB_ENV
+          echo "WORDLIST_URL=${{ github.event.inputs.wordlist_url }}" >> $GITHUB_ENV
+          echo "EXTENSIONS=${{ github.event.inputs.extensions }}" >> $GITHUB_ENV
+          echo "FFUF_FOLLOW=${{ github.event.inputs.follow_redirects }}" >> $GITHUB_ENV
+          echo "FFUF_TIMEOUT=${{ github.event.inputs.timeout }}" >> $GITHUB_ENV
+          echo "STATUS_CODES=${{ github.event.inputs.status_codes }}" >> $GITHUB_ENV
+
+      - name: Download / prepare wordlist
+        run: |
+          WL=wordlists/wordlist.txt
+          if [ -n "$WORDLIST_URL" ]; then
+            curl -fsSL "$WORDLIST_URL" -o "$WL" || true
+          fi
+          if [ ! -s "$WL" ]; then
+            echo "admin" > "$WL"
+            echo "backup" >> "$WL"
+            echo "config" >> "$WL"
+            echo ".git" >> "$WL"
+            echo ".env" >> "$WL"
+          fi
+          # small unique set
+          sort -u "$WL" -o "$WL"
+          wc -l "$WL"
+
+      - name: Gather known paths from common archives (gau) - optional but powerful
+        run: |
+          if command -v gau >/dev/null 2>&1; then
+            mkdir -p path-discovery-output/gau
+            gau --subs "$TARGET_HOST" 2>/dev/null | sed 's#https\?://[^/]*##' | sort -u > path-discovery-output/gau/gau_paths.txt || true
+            echo "Gau results: $(wc -l path-discovery-output/gau/gau_paths.txt || true)"
+          else
+            touch path-discovery-output/gau/gau_paths.txt
+          fi
+
+      - name: Probe host to ensure HTTP(s) live URLs (httpx)
+        run: |
+          mkdir -p path-discovery-output/probe
+          # probe target host for http(s) responsiveness and gather scheme
+          echo "$TARGET_URL" > path-discovery-output/probe/seeds.txt
+          if command -v httpx >/dev/null 2>&1; then
+            httpx -silent -l path-discovery-output/probe/seeds.txt -timeout "${FFUF_TIMEOUT}" -threads 10 -o path-discovery-output/probe/httpx_results.txt || true
+            awk '{print $1}' path-discovery-output/probe/httpx_results.txt | sort -u > path-discovery-output/probe/live_urls.txt || true
+          else
+            cp path-discovery-output/probe/seeds.txt path-discovery-output/probe/live_urls.txt || true
+          fi
+          echo "Live URLs count: $(wc -l < path-discovery-output/probe/live_urls.txt || echo 0)"
+
+      - name: Build ffuf targets list (with possible extensions)
+        run: |
+          mkdir -p path-discovery-output/ffuf
+          # use live urls or fallback to TARGET_URL
+          if [ -s path-discovery-output/probe/live_urls.txt ]; then
+            cp path-discovery-output/probe/live_urls.txt path-discovery-output/ffuf/targets.txt
+          else
+            echo "$TARGET_URL" > path-discovery-output/ffuf/targets.txt
+          fi
+          # if extensions provided, create commands that include them (ffuf -e)
+          echo "Targets prepared: $(wc -l path-discovery-output/ffuf/targets.txt || true)"
+
+      - name: Run ffuf on each live URL (parallel)
+        run: |
+          set -euo pipefail
+          mkdir -p path-discovery-output/ffuf/results
+          THREADS="${FFUF_THREADS:-40}"
+          FOLLOW_FLAG=""
+          if [ "$FFUF_FOLLOW" = "true" ] || [ "$FFUF_FOLLOW" = "True" ]; then
+            FOLLOW_FLAG="-r"
+          fi
+          STATUS_FILTER=""
+          if [ -n "$STATUS_CODES" ]; then
+            # convert commas to comma no spaces
+            STATUS_FILTER="-mc $(echo \"$STATUS_CODES\" | tr -d ' ' )"
+          fi
+          # prepare extension flags for ffuf (-e ext1,ext2)
+          EXT_FLAG=""
+          if [ -n "$EXTENSIONS" ]; then
+            # normalize comma separated
+            EXT_CLEAN=$(echo "$EXTENSIONS" | sed 's/ //g')
+            EXT_FLAG="-e $(echo $EXT_CLEAN | tr ',' ' ')"
+          fi
+
+          while read -r base; do
+            name=$(echo "$base" | sed -E 's#https?://##' | sed -E 's/[:/]+#_#g')
+            out="path-discovery-output/ffuf/results/ffuf_${name}.json"
+            echo "Running ffuf against $base -> $out"
+            # run ffuf: wordlist fuzzing on /FUZZ and also try common extensions automatically by -e
+            /usr/bin/env bash -lc "ffuf -u '${base}/FUZZ' -w wordlists/wordlist.txt -t ${THREADS} -timeout ${FFUF_TIMEOUT} -of json ${FOLLOW_FLAG} ${EXT_FLAG} ${STATUS_FILTER} -fw 0 -o '$out' || true"
+            # also combine gau found paths if available (quick check)
+            if [ -s path-discovery-output/gau/gau_paths.txt ]; then
+              jq -r '.results[]?.url' "$out" 2>/dev/null | sort -u > /dev/null || true
+            fi
+          done < path-discovery-output/ffuf/targets.txt
+
+      - name: Collect ffuf hits (aggregate)
+        run: |
+          mkdir -p path-discovery-output/ffuf/aggregate
+          # extract found paths (unique)
+          for f in path-discovery-output/ffuf/results/*.json; do
+            [ -f "$f" ] || continue
+            jq -r '.results[]?.url' "$f" 2>/dev/null || true
+          done | sed 's#https\?://[^/]*##' | sort -u > path-discovery-output/ffuf/aggregate/unique_paths.txt || true
+          echo "Unique discovered paths: $(wc -l < path-discovery-output/ffuf/aggregate/unique_paths.txt || echo 0)"
+
+      - name: Generate short report
+        run: |
+          mkdir -p path-discovery-output/report
+          {
+            echo "Path Discovery Report"
+            echo "Target: $TARGET_URL"
+            echo ""
+            echo "Discovered unique paths: $(wc -l < path-discovery-output/ffuf/aggregate/unique_paths.txt || echo 0)"
+            echo ""
+            echo "Sample paths:"
+            head -n 50 path-discovery-output/ffuf/aggregate/unique_paths.txt 2>/dev/null || true
+          } > path-discovery-output/report/summary.txt
+          sed -n '1,200p' path-discovery-output/report/summary.txt
+
+      - name: Upload artifacts (results + wordlist + report)
+        uses: actions/upload-artifact@v4
+        with:
+          name: path-discovery-${{ github.run_id }}-${{ github.event.inputs.domain }}
+          path: |
+            path-discovery-output/**
+
+      - name: Notify (Discord if configured) - short summary
+        if: env.DISCORD_WEBHOOK != ''
+        run: |
+          SUMMARY=$(cat path-discovery-output/report/summary.txt | jq -Rs .)
+          curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": $SUMMARY}" "${{ env.DISCORD_WEBHOOK }}" || true
+
+      - name: Print final location
+        run: |
+          echo "Artifacts uploaded. Check Actions run page -> Artifacts for path-discovery-${{ github.run_id }}-*"
