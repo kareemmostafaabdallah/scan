@@ -1,0 +1,95 @@
+name: Injection Detection (SSRF / LFI / RCE checks)
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Target domain (example.com)'
+        required: true
+        default: 'example.com'
+
+jobs:
+  injection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate webhook
+        run: |
+          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "::error::DISCORD_WEBHOOK secret is required"
+            exit 1
+          fi
+          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl git build-essential ffuf || true
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+          /usr/bin/env bash -lc "go install github.com/projectdiscovery/httpx/cmd/httpx@latest" || true
+          /usr/bin/env bash -lc "go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest" || true
+
+      - name: Set domain
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.domain }}" ]; then
+            echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
+          else
+            echo "DOMAIN=example.com" >> $GITHUB_ENV
+          fi
+          echo "CONC=15" >> $GITHUB_ENV
+
+      - name: Discover live URLs (simple)
+        run: |
+          mkdir -p inj-output
+          # use httpx to probe the domain root and common subpaths
+          printf "%s\n" "https://${DOMAIN}" "https://www.${DOMAIN}" > inj-output/seed.txt
+          if command -v httpx >/dev/null 2>&1; then
+            httpx -l inj-output/seed.txt -silent -threads "${CONC}" -o inj-output/httpx_seed.txt || true
+            awk '{print $1}' inj-output/httpx_seed.txt | sort -u > inj-output/live_urls.txt || true
+          else
+            cp inj-output/seed.txt inj-output/live_urls.txt || true
+          fi
+
+      - name: Run nuclei checks for ssrf/lfi/rce (templates)
+        run: |
+          mkdir -p inj-output/nuclei
+          if command -v nuclei >/dev/null 2>&1; then
+            nuclei -update-templates || true
+            # common tags used by nuclei templates: ssrf, lfi, rce, rce-cve (templates vary)
+            nuclei -l inj-output/live_urls.txt -tags ssrf,lfi,rce -silent -o inj-output/nuclei/nuclei_injection.txt || true
+          else
+            touch inj-output/nuclei/nuclei_injection.txt
+          fi
+
+      - name: Fuzz common parameters to find injection points (ffuf example)
+        run: |
+          mkdir -p inj-output/fuzz
+          # fuzz simple common parameters on root URL if present
+          if [ -s inj-output/live_urls.txt ]; then
+            TARGET=$(head -n1 inj-output/live_urls.txt)
+            # try a few common query parameters
+            for param in url callback next return file path; do
+              ffuf -w <(printf "test\nhttp://127.0.0.1\nhttps://example.com\n") -u "${TARGET}?${param}=FUZZ" -mc 200,302 -t 20 -o inj-output/fuzz/ffuf_${param}.json -of json || true
+            done
+            # collect any found URLs
+            jq -r '.results[]?.url' inj-output/fuzz/*.json 2>/dev/null | sort -u > inj-output/fuzz/found_params.txt || true
+          else
+            touch inj-output/fuzz/found_params.txt
+          fi
+
+      - name: Aggregate & upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: injection-output-${{ github.run_id }}
+          path: inj-output
+
+      - name: Notify results
+        run: |
+          NUC_FOUND=$(wc -l < inj-output/nuclei/nuclei_injection.txt 2>/dev/null || echo 0)
+          FUZZ_FOUND=$(wc -l < inj-output/fuzz/found_params.txt 2>/dev/null || echo 0)
+          SUMMARY="✅ Injection detection finished for ${DOMAIN}\nNuclei injection hits: ${NUC_FOUND}\nFuzz-found params: ${FUZZ_FOUND}\n(Artifacts uploaded)"
+          curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": $(echo \"$SUMMARY\" | jq -Rs .)}" "${DISCORD_WEBHOOK}" || true
