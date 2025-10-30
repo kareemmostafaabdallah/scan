@@ -1,0 +1,193 @@
+name: Continuous Recon + Auto-Triage
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Target domain (example.com)'
+        required: true
+        default: 'example.com'
+  schedule:
+    - cron: '0 4 * * *' # daily at 04:00 UTC, change or remove if you want only manual runs
+
+jobs:
+  continuous-recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    env:
+      DEFAULT_DOMAIN: example.com
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        run: |
+          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "::error::DISCORD_WEBHOOK secret is required for notifications"
+            exit 1
+          fi
+          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
+
+      - name: Setup environment & install deps
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y git curl jq build-essential python3 python3-pip make gcc unzip || true
+          # ensure Go bin dir is on PATH
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install Go tools (subfinder, assetfinder, httpx, dnsx, nuclei, subjack)
+        run: |
+          export PATH=$PATH:$HOME/go/bin:$HOME/.local/bin
+          /usr/bin/env bash -lc "go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest" || true
+          /usr/bin/env bash -lc "go install -v github.com/tomnomnom/assetfinder@latest" || true
+          /usr/bin/env bash -lc "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest" || true
+          /usr/bin/env bash -lc "go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest" || true
+          /usr/bin/env bash -lc "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest" || true
+          /usr/bin/env bash -lc "go install -v github.com/haccer/subjack@latest" || true
+          # create output dir
+          mkdir -p recon-output
+
+      - name: Set inputs
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
+          else
+            echo "DOMAIN=${{ env.DEFAULT_DOMAIN }}" >> $GITHUB_ENV
+          fi
+          echo "CONC=20" >> $GITHUB_ENV
+
+      - name: Notify start (Discord)
+        run: |
+          curl -s -X POST -H "Content-Type: application/json" \
+            -d "{\"content\":\"🚀 **Continuous Recon started**\\n**Domain:** ${{ env.DOMAIN }}\\n**Mode:** passive+quick-active\"}" \
+            "${{ env.DISCORD_WEBHOOK }}" || true
+
+      - name: Passive enumeration (crt.sh + subfinder + assetfinder)
+        run: |
+          DOMAIN="${{ env.DOMAIN }}"
+          mkdir -p recon-output/passive
+          # crt.sh
+          curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' | tr ',' '\n' > recon-output/passive/crtsh.txt || true
+          # subfinder
+          subfinder -d "$DOMAIN" -silent -o recon-output/passive/subfinder.txt || true
+          # assetfinder
+          assetfinder --subs-only "$DOMAIN" > recon-output/passive/assetfinder.txt 2>/dev/null || true
+          # merge unique
+          cat recon-output/passive/*.txt 2>/dev/null | sed '/^\s*$/d' | sort -u > recon-output/all-subs.txt || true
+          echo "PASSIVE_COUNT=$(wc -l < recon-output/all-subs.txt || echo 0)" >> $GITHUB_ENV
+
+      - name: Fast resolution & HTTP probe (dnsx/httpx)
+        run: |
+          mkdir -p recon-output/resolved recon-output/httpx
+          # resolve with dnsx for speed; fallback to simple getent if dnsx not available
+          if command -v dnsx >/dev/null 2>&1; then
+            dnsx -l recon-output/all-subs.txt -silent -resp -o recon-output/resolved/dnsx_ok.txt || true
+            awk '{print $1}' recon-output/resolved/dnsx_ok.txt | sed 's/\.$//' | sort -u > recon-output/resolved/resolved_hosts.txt || true
+          else
+            # fallback: try HTTP probe directly
+            cat recon-output/all-subs.txt | sort -u > recon-output/resolved/resolved_hosts.txt || true
+          fi
+          # probe HTTP(s) to get live URLs
+          if command -v httpx >/dev/null 2>&1; then
+            httpx -l recon-output/resolved/resolved_hosts.txt -silent -threads "${{ env.CONC }}" -status-code -o recon-output/httpx/httpx_all.txt || true
+            awk '{print $1}' recon-output/httpx/httpx_all.txt | sort -u > recon-output/httpx/live_urls.txt || true
+          else
+            # minimal probe using curl (slow)
+            > recon-output/httpx/live_urls.txt
+            while read -r host; do
+              if curl -s --max-time 5 -I "https://$host" >/dev/null 2>&1 || curl -s --max-time 5 -I "http://$host" >/dev/null 2>&1; then
+                echo "https://$host" >> recon-output/httpx/live_urls.txt
+              fi
+            done < recon-output/resolved/resolved_hosts.txt || true
+          fi
+          echo "LIVE_URLS=$(wc -l < recon-output/httpx/live_urls.txt || echo 0)" >> $GITHUB_ENV
+
+      - name: Nuclei quick vulnerability scan (critical/high)
+        run: |
+          mkdir -p recon-output/nuclei
+          if ! command -v nuclei >/dev/null 2>&1; then
+            echo "::warning::nuclei not installed - skipping nuclei stage"; exit 0
+          fi
+          nuclei -update-templates || true
+          if [ -s recon-output/httpx/live_urls.txt ]; then
+            nuclei -l recon-output/httpx/live_urls.txt -severity critical,high -silent -o recon-output/nuclei/nuclei_raw.txt || true
+          else
+            echo "" > recon-output/nuclei/nuclei_raw.txt
+          fi
+          # quick triage: keep only lines that include 'critical' or 'high' (template outputs usually include severity)
+          if [ -s recon-output/nuclei/nuclei_raw.txt ]; then
+            grep -E "critical|high" recon-output/nuclei/nuclei_raw.txt > recon-output/nuclei/nuclei_important.txt || cp recon-output/nuclei/nuclei_raw.txt recon-output/nuclei/nuclei_important.txt
+          else
+            touch recon-output/nuclei/nuclei_important.txt
+          fi
+          echo "NUC_COUNT=$(wc -l < recon-output/nuclei/nuclei_important.txt || echo 0)" >> $GITHUB_ENV
+
+      - name: Subdomain takeover check (subjack + nuclei takeover)
+        run: |
+          mkdir -p recon-output/takeover
+          # subjack run (if available)
+          if command -v subjack >/dev/null 2>&1; then
+            subjack -w recon-output/all-subs.txt -a -t 40 -timeout 30 -ssl -o recon-output/takeover/subjack_raw.txt || true
+            grep -i "vulnerable" recon-output/takeover/subjack_raw.txt > recon-output/takeover/subjack_hits.txt || true
+          else
+            touch recon-output/takeover/subjack_hits.txt
+          fi
+          # nuclei takeover templates
+          if command -v nuclei >/dev/null 2>&1 && [ -s recon-output/httpx/live_urls.txt ]; then
+            nuclei -l recon-output/httpx/live_urls.txt -tags takeover -silent -o recon-output/takeover/nuclei_takeover.txt || true
+          else
+            touch recon-output/takeover/nuclei_takeover.txt
+          fi
+          echo "TAKEOVER_SUBJACK=$(wc -l < recon-output/takeover/subjack_hits.txt || echo 0)" >> $GITHUB_ENV
+          echo "TAKEOVER_NUCLEI=$(wc -l < recon-output/takeover/nuclei_takeover.txt || echo 0)" >> $GITHUB_ENV
+
+      - name: Basic auto-triage & dedupe findings
+        run: |
+          mkdir -p recon-output/triage
+          # combine nuclei important + takeover hits into a single triage file
+          cat recon-output/nuclei/nuclei_important.txt recon-output/takeover/subjack_hits.txt recon-output/takeover/nuclei_takeover.txt 2>/dev/null | sed '/^\s*$/d' | sort -u > recon-output/triage/combined_findings.txt || true
+          # add context lines counts
+          echo "PASSIVE=$(cat recon-output/all-subs.txt 2>/dev/null | wc -l || echo 0)" > recon-output/triage/summary_counts.txt
+          echo "LIVE=$(cat recon-output/httpx/live_urls.txt 2>/dev/null | wc -l || echo 0)" >> recon-output/triage/summary_counts.txt
+          echo "NUCLEI=$(wc -l < recon-output/nuclei/nuclei_important.txt 2>/dev/null || echo 0)" >> recon-output/triage/summary_counts.txt
+          echo "TAKEOVER_SUBJACK=$(wc -l < recon-output/takeover/subjack_hits.txt 2>/dev/null || echo 0)" >> recon-output/triage/summary_counts.txt
+          echo "TAKEOVER_NUCLEI=$(wc -l < recon-output/takeover/nuclei_takeover.txt 2>/dev/null || echo 0)" >> recon-output/triage/summary_counts.txt
+
+      - name: Generate small report (Markdown)
+        run: |
+          mkdir -p recon-output/report
+          echo "# Continuous Recon Report" > recon-output/report/report.md
+          echo "" >> recon-output/report/report.md
+          echo "Domain: ${{ env.DOMAIN }}" >> recon-output/report/report.md
+          echo "" >> recon-output/report/report.md
+          echo "## Summary counts" >> recon-output/report/report.md
+          cat recon-output/triage/summary_counts.txt >> recon-output/report/report.md
+          echo "" >> recon-output/report/report.md
+          echo "## Top findings (sample)" >> recon-output/report/report.md
+          head -n 50 recon-output/triage/combined_findings.txt 2>/dev/null >> recon-output/report/report.md || true
+
+      - name: Upload artifacts (all outputs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuous-recon-${{ env.DOMAIN }}-${{ github.run_id }}
+          path: |
+            recon-output/all-subs.txt
+            recon-output/resolved/*
+            recon-output/httpx/*
+            recon-output/nuclei/*
+            recon-output/takeover/*
+            recon-output/triage/*
+            recon-output/report/*
+
+      - name: Final notify & summary (Discord)
+        run: |
+          PASSIVE=$(cat recon-output/all-subs.txt 2>/dev/null | wc -l || echo 0)
+          LIVE=$(cat recon-output/httpx/live_urls.txt 2>/dev/null | wc -l || echo 0)
+          NUC=$(wc -l < recon-output/nuclei/nuclei_important.txt 2>/dev/null || echo 0)
+          SJ=$(wc -l < recon-output/takeover/subjack_hits.txt 2>/dev/null || echo 0)
+          NUK=$(wc -l < recon-output/takeover/nuclei_takeover.txt 2>/dev/null || echo 0)
+          SUMMARY="✅ Continuous Recon finished\nDomain: ${{ env.DOMAIN }}\nPassive subs: ${PASSIVE}\nLive URLs: ${LIVE}\nNuclei (crit/high): ${NUC}\nTakeover hits (subjack): ${SJ}\nTakeover templates (nuclei): ${NUK}\nArtifacts: available in Actions run"
+          curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": $(echo \"$SUMMARY\" | jq -Rs .)}" "${{ env.DISCORD_WEBHOOK }}" || true
