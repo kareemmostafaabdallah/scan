@@ -1,0 +1,61 @@
+name: Takeover & Asset Inventory
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Domain to scan (example.com)'
+        required: true
+        default: 'example.com'
+
+jobs:
+  takeover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate webhook
+        run: |
+          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "::error::Missing DISCORD_WEBHOOK"; exit 1
+          fi
+          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
+
+      - name: Install tools
+        run: |
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+          /usr/bin/env bash -lc "go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest" || true
+          /usr/bin/env bash -lc "go install github.com/haccer/subjack@latest" || true
+          /usr/bin/env bash -lc "go install github.com/projectdiscovery/chaos-client/cmd/chaos@latest" || true
+
+      - name: Enumerate subs + inventory
+        run: |
+          mkdir -p takeover-output
+          subfinder -d "${{ github.event.inputs.domain }}" -silent -o takeover-output/subs.txt || true
+          if [ -n "${{ secrets.CHAOS_API_KEY }}" ]; then
+            export CHAOS_API_KEY="${{ secrets.CHAOS_API_KEY }}"
+            chaos -d "${{ github.event.inputs.domain }}" -silent -o takeover-output/chaos.txt || true
+          fi
+          cat takeover-output/*.txt | sort -u > takeover-output/all_subs.txt || true
+
+      - name: Run subjack
+        run: |
+          if command -v subjack >/dev/null 2>&1; then
+            subjack -w takeover-output/all_subs.txt -a -t 40 -v 2 -o takeover-output/subjack_raw.txt || true
+            grep -i "vulnerable" takeover-output/subjack_raw.txt > takeover-output/subjack_hits.txt || true
+          else
+            touch takeover-output/subjack_hits.txt
+          fi
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: takeover-inventory-${{ github.run_id }}
+          path: takeover-output
+
+      - name: Notify
+        run: |
+          HITS=$(wc -l < takeover-output/subjack_hits.txt 2>/dev/null || echo 0)
+          curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": \"🔔 Takeover scan finished — hits: ${HITS} (artifacts uploaded)\" }" "${{ env.DISCORD_WEBHOOK }}"
