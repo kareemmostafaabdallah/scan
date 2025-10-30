@@ -1,0 +1,72 @@
+name: Web Fuzz & Sensitive Files Finder
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Target domain (example.com)'
+        required: true
+        default: 'example.com'
+      wordlist_url:
+        description: 'Wordlist raw URL'
+        required: false
+        default: 'https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-small-words.txt'
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate webhook
+        run: |
+          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "::error::Missing DISCORD_WEBHOOK"; exit 1
+          fi
+          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y ffuf jq curl || true
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Prepare wordlist
+        run: |
+          mkdir -p fuzz-output
+          WL="fuzz-output/wordlist.txt"
+          curl -fsSL "${{ github.event.inputs.wordlist_url }}" -o "$WL" || echo -e "admin\nbackup\nconfig\n.git\n.env" > "$WL"
+
+      - name: Discover hosts (simple httpx probe)
+        run: |
+          echo "${{ github.event.inputs.domain }}" > fuzz-output/targets.txt
+          if command -v httpx >/dev/null 2>&1; then
+            httpx -l fuzz-output/targets.txt -silent -o fuzz-output/httpx.txt || true
+            awk '{print $1}' fuzz-output/httpx.txt | sed 's|https\?://||' | sort -u > fuzz-output/hosts.txt || true
+          else
+            echo "${{ github.event.inputs.domain }}" > fuzz-output/hosts.txt
+          fi
+
+      - name: Run ffuf on hosts
+        run: |
+          while read -r host; do
+            url="https://$host/FUZZ"
+            ffuf -w fuzz-output/wordlist.txt -u "$url" -mc 200,301,302 -t 40 -o "fuzz-output/ffuf_$(echo $host | tr '/:' '_').json" -of json || true
+          done < fuzz-output/hosts.txt
+
+      - name: Collect sensitive hits
+        run: |
+          mkdir -p fuzz-output/hits
+          jq -r '.results[]?.url' fuzz-output/ffuf_*.json 2>/dev/null | sort -u > fuzz-output/hits/possible_urls.txt || true
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-output-${{ github.run_id }}
+          path: fuzz-output
+
+      - name: Notify
+        run: |
+          HITS=$(wc -l < fuzz-output/hits/possible_urls.txt 2>/dev/null || echo 0)
+          curl -s -X POST -H "Content-Type: application/json" -d "{\"content\": \"🔎 Fuzz finished — possible sensitive URLs: ${HITS} (see artifacts)\" }" "${{ env.DISCORD_WEBHOOK }}"
