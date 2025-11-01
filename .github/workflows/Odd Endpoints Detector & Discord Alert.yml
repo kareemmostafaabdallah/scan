@@ -3,98 +3,225 @@ name: Odd Endpoints Detector & Discord Alert
 on:
   workflow_dispatch:
     inputs:
-      target:
-        description: 'Target domain or base URL (e.g. https://example.com)'
+      domain:
+        description: "Target domain (example.com or https://example.com)"
         required: true
-        default: 'https://example.com'
+        default: "example.com"
+      wordlist_url:
+        description: "Wordlist URL for small ffuf checks (defaults to SecLists raft-small)"
+        required: false
+        default: "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-small-words.txt"
+      threads:
+        description: "ffuf/httpx threads"
+        required: false
+        default: "20"
+      follow_redirects:
+        description: "ffuf follow redirects (true/false)"
+        required: false
+        default: "false"
+      status_filter:
+        description: "Comma separated suspicious status codes (defaults to 401,403,500,502,503,302)"
+        required: false
+        default: "401,403,500,502,503,302"
+      keyword_list:
+        description: "Comma separated suspicious keywords (admin,login,debug,backup,wp-admin,config,upload)"
+        required: false
+        default: "admin,login,debug,backup,wp-admin,config,upload,portal,dashboard"
+      max_path_length:
+        description: "Path length threshold to consider suspicious"
+        required: false
+        default: "120"
 
 jobs:
   detect:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Validate webhook secret
         run: |
-          sudo apt update -y
-          sudo apt install -y jq curl httpx ffuf
-
-      - name: Prepare environment
-        run: |
-          set -euo pipefail
-          mkdir -p odd-endpoints-output
-          echo "TARGET_URL=${{ github.event.inputs.target }}" >> $GITHUB_ENV
-
-      - name: Fuzz paths using ffuf
-        run: |
-          set -euo pipefail
-          WORDLIST=/usr/share/wordlists/dirb/common.txt
-          OUTPUT=odd-endpoints-output/paths.txt
-
-          ffuf -u "${TARGET_URL}/FUZZ" -w "$WORDLIST" -t 50 -of csv -o ffuf_results.csv || true
-          cut -d',' -f1 ffuf_results.csv | grep -E -v '^url$' | sort -u > "$OUTPUT"
-          echo "[+] Found $(wc -l < "$OUTPUT") paths"
-
-      - name: Analyze paths
-        run: |
-          set -euo pipefail
-          INPUT=odd-endpoints-output/paths.txt
-          OUTPUT_JSON=odd-endpoints-output/results.json
-          : > "$OUTPUT_JSON"
-
-          while read -r path; do
-            [ -z "$path" ] && continue
-            URL="${TARGET_URL}/${path}"
-
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -L "$URL" || echo "000")
-            LENGTH=$(curl -s -L "$URL" | wc -c || echo "0")
-            SERVER_HDR=$(curl -s -I "$URL" | grep -i '^Server:' | tr '\n' ' ' | sed 's/"/\\"/g' || echo "")
-            REASONS=()
-
-            if [[ "$STATUS" =~ ^(401|403|500|502|503|302)$ ]]; then
-              REASONS+=("status_$STATUS")
-            fi
-
-            if echo "$path" | grep -Ei 'admin|debug|config|backup|upload|portal' >/dev/null; then
-              REASONS+=("keyword_match")
-            fi
-
-            if echo "$path" | grep -Ei '\.env|\.git|backup|\.zip|\.sql|\.bak' >/dev/null; then
-              REASONS+=("sensitive_file")
-            fi
-
-            if [ "${#REASONS[@]}" -gt 0 ]; then
-              jq -n \
-                --arg url "$URL" \
-                --arg status "$STATUS" \
-                --arg length "$LENGTH" \
-                --arg server "$SERVER_HDR" \
-                --arg reasons "$(IFS=','; echo "${REASONS[*]}")" \
-                '{url:$url, status:$status, length:$length, server:$server, reasons:($reasons | split(","))}' >> "$OUTPUT_JSON"
-            fi
-          done < "$INPUT"
-
-          echo "[+] Saved suspicious endpoints to $OUTPUT_JSON"
-
-      - name: Send to Discord
-        if: always()
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          set -euo pipefail
-          FILE=odd-endpoints-output/results.json
-          if [ ! -s "$FILE" ]; then
-            echo "No suspicious endpoints found."
-            exit 0
+          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "::warning::DISCORD_WEBHOOK secret not set. Discord notifications will be skipped."
+          else
+            echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
           fi
 
-          jq -c '.' "$FILE" | while read -r line; do
-            URL=$(echo "$line" | jq -r '.url')
-            STATUS=$(echo "$line" | jq -r '.status')
-            REASONS=$(echo "$line" | jq -r '.reasons | join(", ")')
-            MSG="🕵️ Odd endpoint found:\nURL: $URL\nStatus: $STATUS\nReasons: $REASONS"
-            curl -H "Content-Type: application/json" \
-                 -d "{\"content\": \"$MSG\"}" \
-                 "$DISCORD_WEBHOOK"
-          done
+      - name: Install deps & tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl git build-essential python3 python3-pip wget unzip || true
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          export PATH=$PATH:$HOME/go/bin:$HOME/.local/bin
+          export GOBIN=${GOBIN:-$HOME/.local/bin}
+          mkdir -p $GOBIN
+          /usr/bin/env bash -lc "GOBIN=$GOBIN go install github.com/projectdiscovery/httpx/cmd/httpx@latest" || true
+          /usr/bin/env bash -lc "GOBIN=$GOBIN go install github.com/lc/gau/v2/cmd/gau@latest" || true
+          /usr/bin/env bash -lc "GOBIN=$GOBIN go install github.com/ffuf/ffuf@latest" || true
+          jq --version || true
+          mkdir -p odd-endpoints-output tmp wordlists
+
+      - name: Prepare environment variables
+        run: |
+          RAW="${{ github.event.inputs.domain }}"
+          if echo "$RAW" | grep -qE '^https?://'; then
+            HOST=$(echo "$RAW" | sed -E 's#^https?://##' | sed -E 's#/$##')
+            echo "TARGET_URL=https://$HOST" >> $GITHUB_ENV
+            echo "TARGET_HOST=$HOST" >> $GITHUB_ENV
+          else
+            HOST="$RAW"
+            echo "TARGET_URL=https://$HOST" >> $GITHUB_ENV
+            echo "TARGET_HOST=$HOST" >> $GITHUB_ENV
+          fi
+          echo "THREADS=${{ github.event.inputs.threads }}" >> $GITHUB_ENV
+          echo "WORDLIST_URL=${{ github.event.inputs.wordlist_url }}" >> $GITHUB_ENV
+          echo "FOLLOW_FLAG=${{ github.event.inputs.follow_redirects }}" >> $GITHUB_ENV
+          echo "STATUS_FILTER=${{ github.event.inputs.status_filter }}" >> $GITHUB_ENV
+          echo "KEYWORDS_RAW=${{ github.event.inputs.keyword_list }}" >> $GITHUB_ENV
+          echo "MAX_PATH_LENGTH=${{ github.event.inputs.max_path_length }}" >> $GITHUB_ENV
+
+      - name: Download small wordlist
+        run: |
+          WL=wordlists/wordlist.txt
+          if [ -n "$WORDLIST_URL" ]; then
+            curl -fsSL "$WORDLIST_URL" -o "$WL" || true
+          fi
+          if [ ! -s "$WL" ]; then
+            printf "admin\nlogin\nbackup\nconfig\n.git\n.env\n" > "$WL"
+          fi
+          sort -u "$WL" -o "$WL" || true
+          echo "wordlist lines: $(wc -l < $WL || echo 0)"
+
+      - name: Gather paths (gau + quick ffuf poke)
+        run: |
+          set -euo pipefail
+          mkdir -p odd-endpoints-output/gau odd-endpoints-output/ffuf
+          # gather from gau (wayback + common archives)
+          if command -v gau >/dev/null 2>&1; then
+            gau --subs "$TARGET_HOST" 2>/dev/null | sed 's#https\?://[^/]*##' | sort -u > odd-endpoints-output/gau/gau_paths.txt || true
+          else
+            touch odd-endpoints-output/gau/gau_paths.txt
+          fi
+          # also perform a quick ffuf run on root to find common admin-like endpoints
+          FF_THREADS="${THREADS:-20}"
+          FF_TIMEOUT="${{ github.event.inputs.timeout || '8' }}"
+          if command -v ffuf >/dev/null 2>&1; then
+            ffuf -u "${TARGET_URL}/FUZZ" -w wordlists/wordlist.txt -t "${FF_THREADS}" -timeout "${FF_TIMEOUT}" -of json -o odd-endpoints-output/ffuf/ffuf_root.json || true
+            jq -r '.results[]?.url' odd-endpoints-output/ffuf/ffuf_root.json 2>/dev/null | sed 's#https\?://[^/]*##' | sort -u > odd-endpoints-output/ffuf/ffuf_root_paths.txt || true
+          else
+            touch odd-endpoints-output/ffuf/ffuf_root_paths.txt
+          fi
+          # merge
+          cat odd-endpoints-output/gau/gau_paths.txt odd-endpoints-output/ffuf/ffuf_root_paths.txt | sed '/^\s*$/d' | sort -u > odd-endpoints-output/all_paths_raw.txt || true
+          echo "Total candidate paths: $(wc -l < odd-endpoints-output/all_paths_raw.txt || echo 0)"
+
+      - name: Probe candidate endpoints with httpx and classify suspicious ones
+        run: |
+          set -euo pipefail
+          mkdir -p odd-endpoints-output/probe
+          INPUT=odd-endpoints-output/all_paths_raw.txt
+          # if no candidate paths, create a few defaults
+          if [ ! -s "$INPUT" ]; then
+            printf "/admin\n/login\n/wp-admin\n/config\n/.env\n" > "$INPUT"
+          fi
+          # Prepare keywords array
+          IFS=',' read -r -a KW_ARR <<< "${KEYWORDS_RAW:-admin,login,debug,backup,wp-admin,config,upload,dashboard,portal}"
+          # create/empty results file
+          : > odd-endpoints-output/probe/probe_results.json
+          # probe each candidate
+          while IFS= read -r path || [ -n "$path" ]; do
+            # normalize leading slash
+            p="${path#/}"
+            p="/$p"
+            # build full url
+            url="${TARGET_URL}${p}"
+            # probe with httpx for status, title, length, header snapshot
+            if command -v httpx >/dev/null 2>&1; then
+              out=$(echo "$url" | httpx -silent -status-code -title -content-length -ip -threads 10 2>/dev/null || echo "")
+            else
+              out=$(curl -s -I -L --max-time 10 "$url" 2>/dev/null || echo "")
+            fi
+            # parse status if possible (fallback to empty)
+            status=$(echo "$out" | awk '{print $2}' | head -n1 || echo "")
+            length=$(echo "$out" | awk '{print $3}' | head -n1 || echo "")
+            # collect headers separately (fallback)
+            hdrs=$(curl -s -I -L --max-time 10 "$url" 2>/dev/null || echo "")
+            server_hdr=$(echo "$hdrs" | grep -i '^Server:' || true)
+            x_debug=$(echo "$hdrs" | grep -i -E 'x-debug|x-powered-by|x-info' || true)
+            # mark suspicious reasons
+            reasons=()
+            # check status codes
+            if [ -n "$status" ]; then
+              for sc in $(echo "${STATUS_FILTER:-401,403,500,502,503,302}" | tr ',' ' '); do
+                if [ "$status" = "$sc" ]; then
+                  reasons+=("status=$status")
+                fi
+              done
+            fi
+            # check keywords
+            lowpath=$(echo "$p" | tr '[:upper:]' '[:lower:]')
+            for kw in "${KW_ARR[@]}"; do
+              kw_trim=$(echo "$kw" | sed 's/ //g')
+              if [ -n "$kw_trim" ] && echo "$lowpath" | grep -q "$kw_trim"; then
+                reasons+=("keyword=$kw_trim")
+              fi
+            done
+            # check path length
+            plen=$(echo -n "$p" | wc -c)
+            if [ "$plen" -ge "${MAX_PATH_LENGTH:-120}" ]; then
+              reasons+=("long_path=${plen}")
+            fi
+            # check headers for debug
+            if [ -n "$x_debug" ]; then
+              reasons+=("debug_header")
+            fi
+            # check common sensitive filenames
+            if echo "$p" | grep -E '\.env|\.git|backup|\.sql|\.zip|credentials' >/dev/null 2>&1; then
+              reasons+=("sensitive_filename")
+            fi
+            # if any reason found, append to results JSON lines (ndjson)
+            if [ "${#reasons[@]}" -gt 0 ]; then
+              # build JSON safely using jq
+              reasons_json=$(printf '%s\n' "${reasons[@]}" | jq -R . | jq -s .)
+              jq -n --arg url "$url" --arg status "$status" --arg length "$length" --arg server "$(echo "$server_hdr" | tr '\n' ' ')" --argjson reasons "$reasons_json" '{url:$url, status:$status, length:$length, server:$server, reasons:$reasons}' >> odd-endpoints-output/probe/probe_results.json
+            fi
+          done < "$INPUT"
+          # report count (if file exists)
+          if [ -s odd-endpoints-output/probe/probe_results.json ]; then
+            echo "Suspicious endpoints found: $(wc -l < odd-endpoints-output/probe/probe_results.json || echo 0)"
+          else
+            echo "Suspicious endpoints found: 0"
+          fi
+
+      - name: Aggregate and prepare summary
+        run: |
+          mkdir -p odd-endpoints-output/report
+          if [ -s odd-endpoints-output/probe/probe_results.json ]; then
+            # probe_results.json currently NDJSON (one JSON object per line)
+            jq -s '.' odd-endpoints-output/probe/probe_results.json > odd-endpoints-output/report/odd_endpoints.json || true
+            jq -r '.[] | "- " + .url + " [" + (.reasons|join(", ")) + "]"' odd-endpoints-output/report/odd_endpoints.json > odd-endpoints-output/report/summary.txt || true
+          else
+            echo "No suspicious endpoints found." > odd-endpoints-output/report/summary.txt
+          fi
+          sed -n '1,200p' odd-endpoints-output/report/summary.txt
+
+      - name: Notify Discord (if configured)
+        if: env.DISCORD_WEBHOOK != ''
+        run: |
+          if [ -s odd-endpoints-output/report/odd_endpoints.json ]; then
+            TITLE="⚠️ Odd endpoints detected for ${{ github.event.inputs.domain }}"
+            BODY=$(jq -r '.[] | "- " + .url + " [" + (.reasons|join(", ")) + "]"' odd-endpoints-output/report/odd_endpoints.json | jq -Rs .)
+            PAYLOAD="{\"content\":\"${TITLE}\n\nSummary:\\n\" , \"embeds\":[{\"title\":\"Odd endpoints summary\",\"description\":$BODY}]}"
+            curl -s -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "${{ env.DISCORD_WEBHOOK }}" || true
+          else
+            curl -s -X POST -H "Content-Type: application/json" -d "{\"content\":\"✅ Odd endpoints scan finished for ${{ github.event.inputs.domain }} — None found.\"}" "${{ env.DISCORD_WEBHOOK }}" || true
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: odd-endpoints-${{ github.run_id }}-${{ github.event.inputs.domain }}
+          path: |
+            odd-endpoints-output/**
