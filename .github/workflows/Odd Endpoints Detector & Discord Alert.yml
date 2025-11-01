@@ -15,125 +15,86 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up tools
+      - name: Install tools
         run: |
           sudo apt update -y
           sudo apt install -y jq curl httpx ffuf
 
-      - name: Initialize
+      - name: Prepare environment
         run: |
           set -euo pipefail
           mkdir -p odd-endpoints-output
           echo "TARGET_URL=${{ github.event.inputs.target }}" >> $GITHUB_ENV
-          echo "KEYWORDS_RAW=admin,login,debug,backup,wp-admin,config,upload,dashboard,portal" >> $GITHUB_ENV
-          echo "STATUS_FILTER=401,403,500,502,503,302" >> $GITHUB_ENV
-          echo "MAX_PATH_LENGTH=120" >> $GITHUB_ENV
 
-      - name: Discover endpoints using ffuf
+      - name: Fuzz paths using ffuf
         run: |
           set -euo pipefail
           WORDLIST=/usr/share/wordlists/dirb/common.txt
-          OUTPUT=odd-endpoints-output/all_paths_raw.txt
+          OUTPUT=odd-endpoints-output/paths.txt
 
-          echo "[+] Starting ffuf scan on $TARGET_URL"
-          ffuf -u "$TARGET_URL/FUZZ" -w "$WORDLIST" -t 50 -of csv -o ffuf_results.csv || true
-          cut -d',' -f1 ffuf_results.csv | grep -E -v '^url$' > "$OUTPUT"
-          sort -u "$OUTPUT" -o "$OUTPUT"
-          echo "[+] Saved discovered paths: $(wc -l < "$OUTPUT")"
+          ffuf -u "${TARGET_URL}/FUZZ" -w "$WORDLIST" -t 50 -of csv -o ffuf_results.csv || true
+          cut -d',' -f1 ffuf_results.csv | grep -E -v '^url$' | sort -u > "$OUTPUT"
+          echo "[+] Found $(wc -l < "$OUTPUT") paths"
 
-      - name: Probe candidate endpoints with httpx and classify suspicious ones
+      - name: Analyze paths
         run: |
           set -euo pipefail
-          mkdir -p odd-endpoints-output/probe
-          INPUT=odd-endpoints-output/all_paths_raw.txt
-          if [ ! -s "$INPUT" ]; then
-            printf "/admin\n/login\n/wp-admin\n/config\n/.env\n" > "$INPUT"
-          fi
+          INPUT=odd-endpoints-output/paths.txt
+          OUTPUT_JSON=odd-endpoints-output/results.json
+          : > "$OUTPUT_JSON"
 
-          IFS=',' read -r -a KW_ARR <<< "${KEYWORDS_RAW:-admin,login,debug,backup,wp-admin,config,upload,dashboard,portal}"
-          RESULT_FILE=odd-endpoints-output/probe/probe_results.json
-          : > "$RESULT_FILE"
+          while read -r path; do
+            [ -z "$path" ] && continue
+            URL="${TARGET_URL}/${path}"
 
-          while IFS= read -r path || [ -n "$path" ]; do
-            p="${path#/}"
-            p="/${p}"
-            url="${TARGET_URL}${p}"
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -L "$URL" || echo "000")
+            LENGTH=$(curl -s -L "$URL" | wc -c || echo "0")
+            SERVER_HDR=$(curl -s -I "$URL" | grep -i '^Server:' | tr '\n' ' ' | sed 's/"/\\"/g' || echo "")
+            REASONS=()
 
-            if command -v httpx >/dev/null 2>&1; then
-              httpx_out=$(echo "$url" | httpx -silent -status-code -title -content-length -ip -threads 5 2>/dev/null || echo "")
-              status=$(echo "$httpx_out" | awk '{print $2}' | head -n1 || echo "")
-              length=$(echo "$httpx_out" | awk '{print $4}' | head -n1 || echo "")
-            else
-              status=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 10 "$url" 2>/dev/null || echo "")
-              length=$(curl -s -L --max-time 10 "$url" 2>/dev/null | wc -c || echo "")
+            if [[ "$STATUS" =~ ^(401|403|500|502|503|302)$ ]]; then
+              REASONS+=("status_$STATUS")
             fi
 
-            hdrs=$(curl -s -I -L --max-time 10 "$url" 2>/dev/null || echo "")
-            server_hdr=$(echo "$hdrs" | grep -i '^Server:' || true)
-            x_debug=$(echo "$hdrs" | grep -Ei 'x-debug|x-powered-by|x-info' || true)
-
-            reasons_arr=()
-            if [ -n "$status" ]; then
-              for sc in $(echo "${STATUS_FILTER:-401,403,500,502,503,302}" | tr ',' ' '); do
-                if [ "$status" = "$sc" ]; then
-                  reasons_arr+=("status=$status")
-                fi
-              done
+            if echo "$path" | grep -Ei 'admin|debug|config|backup|upload|portal' >/dev/null; then
+              REASONS+=("keyword_match")
             fi
 
-            lowpath=$(echo "$p" | tr '[:upper:]' '[:lower:]')
-            for kw in "${KW_ARR[@]}"; do
-              kw_trim=$(echo "$kw" | sed 's/ //g')
-              if [ -n "$kw_trim" ] && echo "$lowpath" | grep -q "$kw_trim"; then
-                reasons_arr+=("keyword=$kw_trim")
-              fi
-            done
-
-            plen=$(echo -n "$p" | wc -c)
-            if [ "$plen" -ge "${MAX_PATH_LENGTH:-120}" ]; then
-              reasons_arr+=("long_path=${plen}")
+            if echo "$path" | grep -Ei '\.env|\.git|backup|\.zip|\.sql|\.bak' >/dev/null; then
+              REASONS+=("sensitive_file")
             fi
 
-            if [ -n "$x_debug" ]; then
-              reasons_arr+=("debug_header")
-            fi
-
-            if echo "$p" | grep -E '\.env|\.git|backup|\.sql|\.zip|credentials' >/dev/null 2>&1; then
-              reasons_arr+=("sensitive_filename")
-            fi
-
-            if [ "${#reasons_arr[@]}" -gt 0 ]; then
+            if [ "${#REASONS[@]}" -gt 0 ]; then
               jq -n \
-                --arg url "$url" \
-                --arg status "${status:-}" \
-                --arg length "${length:-}" \
-                --arg server "$(echo "$server_hdr" | tr '\n' ' ' | sed 's/"/\\"/g')" \
-                --argjson reasons "$(printf '%s\n' "${reasons_arr[@]}" | jq -R . | jq -s .)" \
-                '{url:$url, status:$status, length:$length, server:$server, reasons:$reasons}' >> "$RESULT_FILE"
+                --arg url "$URL" \
+                --arg status "$STATUS" \
+                --arg length "$LENGTH" \
+                --arg server "$SERVER_HDR" \
+                --arg reasons "$(IFS=','; echo "${REASONS[*]}")" \
+                '{url:$url, status:$status, length:$length, server:$server, reasons:($reasons | split(","))}' >> "$OUTPUT_JSON"
             fi
-
           done < "$INPUT"
 
-          echo "[+] Suspicious endpoints written to $RESULT_FILE"
+          echo "[+] Saved suspicious endpoints to $OUTPUT_JSON"
 
-      - name: Send results to Discord
+      - name: Send to Discord
         if: always()
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           set -euo pipefail
-          FILE=odd-endpoints-output/probe/probe_results.json
+          FILE=odd-endpoints-output/results.json
           if [ ! -s "$FILE" ]; then
             echo "No suspicious endpoints found."
             exit 0
           fi
 
           jq -c '.' "$FILE" | while read -r line; do
-            url=$(echo "$line" | jq -r '.url')
-            reasons=$(echo "$line" | jq -r '.reasons | join(", ")')
-            status=$(echo "$line" | jq -r '.status')
-            msg="🕵️ Odd Endpoint Found:\nURL: $url\nStatus: $status\nReasons: $reasons"
+            URL=$(echo "$line" | jq -r '.url')
+            STATUS=$(echo "$line" | jq -r '.status')
+            REASONS=$(echo "$line" | jq -r '.reasons | join(", ")')
+            MSG="🕵️ Odd endpoint found:\nURL: $URL\nStatus: $STATUS\nReasons: $REASONS"
             curl -H "Content-Type: application/json" \
-                 -d "{\"content\":\"$msg\"}" \
+                 -d "{\"content\": \"$MSG\"}" \
                  "$DISCORD_WEBHOOK"
           done
