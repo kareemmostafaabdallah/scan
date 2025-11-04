@@ -4,23 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       domain:
-        description: 'Domain to scan (e.g. example.com)'
+        description: 'Target domain'
         required: true
         default: 'example.com'
-  schedule:
-    - cron: '0 6 * * 1'  # weekly on Monday 06:00 UTC
 
 env:
-  GOPATH: ${{ runner.home }}/go
-  GOBIN: ${{ runner.home }}/go/bin
+  GOPATH: ${{ runner.temp }}/go
+  GOBIN: ${{ runner.temp }}/go/bin
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Go
@@ -28,202 +26,79 @@ jobs:
         with:
           go-version: '1.21'
 
-      - name: Prepare Go bin and PATH
+      - name: Prepare environment
         run: |
           mkdir -p "${{ env.GOBIN }}"
           echo "${{ env.GOBIN }}" >> $GITHUB_PATH
-          echo "GOBIN created and added to PATH: ${{ env.GOBIN }}"
+          echo "Prepared Go bin: ${{ env.GOBIN }}"
 
-      - name: Install system deps & Go tools
+      - name: Install tools
         run: |
-          set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y jq curl unzip python3-pip git
-          # Install Go-based tools (they will be installed into $GOBIN)
-          GO111MODULE=on go install github.com/OWASP/Amass/v3/...@latest
-          GO111MODULE=on go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          GO111MODULE=on go install github.com/tomnomnom/assetfinder@latest
-          GO111MODULE=on go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-          GO111MODULE=on go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
-          GO111MODULE=on go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          GO111MODULE=on go install github.com/ffuf/ffuf@latest
-          echo "Installed tools in $GOBIN"
-          ls -1 "${{ env.GOBIN }}" || true
+          sudo apt-get install -y jq curl git
+          go install github.com/OWASP/Amass/v3/...@latest
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/ffuf/ffuf@latest
 
-      - name: Validate required secrets & domain input
+      - name: Validate Secrets
         run: |
           if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
-            echo "::error::DISCORD_WEBHOOK secret is not set"
+            echo "::error::DISCORD_WEBHOOK not set"
             exit 1
           fi
           if [ "${{ secrets.SCAN_AUTH }}" != "AUTHORIZED" ]; then
-            echo "::error::You must set repository secret SCAN_AUTH=AUTHORIZED before running this workflow"
+            echo "::error::You must set SCAN_AUTH=AUTHORIZED"
             exit 1
           fi
           echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
           echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
 
-      - name: Notify start (legal warning)
+      - name: Notify Start
         run: |
-          MSG="🔍 Scan started for $DOMAIN. ⚠️ Active enumeration & fuzzing (amass active, ffuf) will run if enabled. Ensure you have written authorization."
-          curl -s -X POST -H "Content-Type: application/json" \
-            -d "$(jq -n --arg m "$MSG" '{content: $m}')" "${{ env.DISCORD_WEBHOOK }}" || true
+          MSG="🔍 Starting scan for $DOMAIN"
+          curl -X POST -H "Content-Type: application/json" \
+            -d "{\"content\":\"$MSG\"}" "${{ env.DISCORD_WEBHOOK }}"
 
-      - name: Create helper scripts
-        run: |
-          mkdir -p scripts tmp
-          cat > scripts/gather_subs_and_urls.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-DOMAIN="$1"
-OUT_SUBS="$2"
-OUT_URLS="$3"
-TMPDIR="tmp"
-
-mkdir -p "${TMPDIR}"
-> "${OUT_SUBS}"
-> "${OUT_URLS}"
-
-echo "[*] Passive enumeration..."
-amass enum -passive -d "$DOMAIN" -o "${TMPDIR}/amass_passive.txt" 2>/dev/null || true
-subfinder -d "$DOMAIN" -silent -o "${TMPDIR}/subfinder.txt" 2>/dev/null || true
-assetfinder --subs-only "$DOMAIN" > "${TMPDIR}/assetfinder.txt" 2>/dev/null || true
-curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' > "${TMPDIR}/crtsh.txt" || true
-
-cat "${TMPDIR}/amass_passive.txt" "${TMPDIR}/subfinder.txt" "${TMPDIR}/assetfinder.txt" "${TMPDIR}/crtsh.txt" | sed 's/\*\.//g' | grep -E "\.${DOMAIN}$" | sort -u > "$OUT_SUBS" || true
-
-echo "[*] Active amass (NOISY) - will run but it's limited"
-amass enum -active -d "$DOMAIN" -o "${TMPDIR}/amass_active.txt" -min-for-recursive 2 || true
-cat "${TMPDIR}/amass_active.txt" >> "$OUT_SUBS" || true
-sort -u "$OUT_SUBS" -o "$OUT_SUBS" || true
-
-echo "[*] Gathering historical URLs via gau if available..."
-if command -v gau >/dev/null 2>&1; then
-  gau "$DOMAIN" > "${TMPDIR}/gau.txt" 2>/dev/null || true
-  grep "$DOMAIN" "${TMPDIR}/gau.txt" | sort -u > "$OUT_URLS" || true
-fi
-
-echo "[*] Done gathering"
-EOF
-          chmod +x scripts/gather_subs_and_urls.sh
-
-          cat > scripts/run_ffuf_on_sensitive.sh <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-URLS_FILE="$1"
-OUT_DIR="$2"
-mkdir -p "$OUT_DIR"
-WORDLIST_DIR="/tmp/wordlists_for_ffuf"
-mkdir -p "$WORDLIST_DIR"
-
-curl -s -L https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt -o "${WORDLIST_DIR}/common.txt" || true
-curl -s -L https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-large-directories.txt -o "${WORDLIST_DIR}/raft-large-directories.txt" || true
-
-grep -E '\?.*=|/login|/admin|/dashboard|/wp-admin|/api/|/oauth|/token|/auth|\.js$' "$URLS_FILE" | sort -u > "${OUT_DIR}/sensitive_candidates.txt" || true
-
-if [ ! -s "${OUT_DIR}/sensitive_candidates.txt" ]; then
-  awk -F/ '{print $1"//"$3"/"}' "$URLS_FILE" | sort -u > "${OUT_DIR}/hosts_roots.txt" || true
-  while read -r h; do
-    echo "${h}admin" >> "${OUT_DIR}/sensitive_candidates.txt"
-    echo "${h}login" >> "${OUT_DIR}/sensitive_candidates.txt"
-    echo "${h}dashboard" >> "${OUT_DIR}/sensitive_candidates.txt"
-  done < "${OUT_DIR}/hosts_roots.txt" || true
-fi
-
-sed -i '/^\s*$/d' "${OUT_DIR}/sensitive_candidates.txt" || true
-
-THREADS=15
-TIMEOUT=10
-BATCH_SIZE=3
-split -l $BATCH_SIZE "${OUT_DIR}/sensitive_candidates.txt" "${OUT_DIR}/batch_"
-
-for batch in "${OUT_DIR}"/batch_*; do
-  while read -r target; do
-    if echo "$target" | grep -q '\?'; then
-      FUZZ_URL=$(echo "$target" | sed -E 's/([?&][^=]+=)[^&]*/\1FUZZ/')
-    else
-      FUZZ_URL="${target}FUZZ"
-    fi
-    WL1="${WORDLIST_DIR}/common.txt"
-    SAFE_NAME=$(echo "$target" | sed -E 's/[^a-zA-Z0-9]/_/g' | cut -c1-80)
-    OUT_JSON="${OUT_DIR}/${SAFE_NAME}_ffuf.json"
-    ffuf -u "$FUZZ_URL" -w "$WL1" -t $THREADS -timeout ${TIMEOUT}s -mc 200,301,302,401,403 -o "$OUT_JSON" -of json || true
-    sleep 1
-  done < "$batch"
-  sleep 4
-done
-EOF
-          chmod +x scripts/run_ffuf_on_sensitive.sh
-
-      - name: Run gathering scripts
+      - name: Enumerate Subdomains
         run: |
           mkdir -p tmp
-          bash scripts/gather_subs_and_urls.sh "$DOMAIN" tmp/subdomains.txt tmp/urls.txt
-          echo "SUBS_COUNT=$(wc -l < tmp/subdomains.txt || echo 0)" >> $GITHUB_ENV
-          echo "URLS_COUNT=$(wc -l < tmp/urls.txt || echo 0)" >> $GITHUB_ENV
+          amass enum -passive -d "$DOMAIN" -o tmp/amass.txt || true
+          subfinder -d "$DOMAIN" -silent -o tmp/subfinder.txt
+          sort -u tmp/amass.txt tmp/subfinder.txt > tmp/subdomains.txt
+          echo "SUBS=$(wc -l < tmp/subdomains.txt)" >> $GITHUB_ENV
 
-      - name: Probe alive hosts / build url list
+      - name: Probe Alive
         run: |
-          mkdir -p tmp
-          # prefer validating URLs (from gau) then probe subdomains
-          if [ -s tmp/urls.txt ]; then
-            cat tmp/urls.txt | ${GOBIN}/httpx -silent -threads 50 -status-code -o tmp/httpx_urls.txt || true
-            awk '{print $1}' tmp/httpx_urls.txt | sort -u > tmp/urls_alive.txt || true
-          else
-            cat tmp/subdomains.txt | sed 's/$/\/ /' | ${GOBIN}/httpx -silent -threads 50 -status-code -o tmp/httpx_hosts.txt || true
-            awk '{print $1}' tmp/httpx_hosts.txt | sort -u > tmp/urls_alive.txt || true
-          fi
-          echo "ALIVE_COUNT=$(wc -l < tmp/urls_alive.txt || echo 0)" >> $GITHUB_ENV
+          httpx -l tmp/subdomains.txt -silent -o tmp/alive.txt
+          echo "ALIVE=$(wc -l < tmp/alive.txt)" >> $GITHUB_ENV
 
-      - name: Update Nuclei templates & run nuclei
+      - name: Run Nuclei
         run: |
-          ${GOBIN}/nuclei -ut || true
-          if [ -s tmp/urls_alive.txt ]; then
-            ${GOBIN}/nuclei -l tmp/urls_alive.txt -severity critical,high,medium -o tmp/nuclei_results.txt -c 50 || true
-          else
-            echo "No alive URLs for nuclei" > tmp/nuclei_results.txt
-          fi
-          echo "NUCLEI_COUNT=$(wc -l < tmp/nuclei_results.txt || echo 0)" >> $GITHUB_ENV
+          nuclei -ut
+          nuclei -l tmp/alive.txt -severity critical,high,medium -o tmp/nuclei.txt
+          echo "NUCLEI=$(wc -l < tmp/nuclei.txt)" >> $GITHUB_ENV
 
-      - name: Run ffuf on sensitive endpoints (noisy)
+      - name: FFUF Sensitive Paths
         run: |
           mkdir -p tmp/ffuf
-          # Only run ffuf if we have alive URLs
-          if [ -s tmp/urls_alive.txt ]; then
-            bash scripts/run_ffuf_on_sensitive.sh tmp/urls_alive.txt tmp/ffuf || true
-          else
-            echo "No alive URLs, skipping ffuf" > tmp/ffuf/README.txt
-          fi
+          grep -E "/(admin|login|dashboard|auth|api)" tmp/alive.txt > tmp/sensitive.txt || true
+          while read -r url; do
+            [ -z "$url" ] && continue
+            safe=$(echo "$url" | sed 's#[^a-zA-Z0-9]#_#g')
+            ffuf -u "${url%/}/FUZZ" -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,403 \
+              -t 20 -of json -o tmp/ffuf/${safe}.json || true
+          done < tmp/sensitive.txt
 
-      - name: Postprocess results
+      - name: Notify Summary
         run: |
-          # dedupe nuclei
-          if [ -f tmp/nuclei_results.txt ]; then
-            sort -u tmp/nuclei_results.txt > tmp/nuclei_results_dedup.txt || true
-          else
-            touch tmp/nuclei_results_dedup.txt
-          fi
-          # Summarize ffuf results into a simple text file
-          > tmp/ffuf_summary.txt
-          for f in tmp/ffuf/*.json 2>/dev/null; do
-            [ -f "$f" ] || continue
-            echo "=== $f ===" >> tmp/ffuf_summary.txt
-            jq -r '.results[]? | "\(.status) \(.input) \(.url)"' < "$f" >> tmp/ffuf_summary.txt || true
-          done || true
-
-      - name: Notify summary (Discord)
-        run: |
-          SUMMARY="📊 Scan summary for $DOMAIN\nSubdomains found: $SUBS_COUNT\nURLs found: $URLS_COUNT\nAlive URLs: $ALIVE_COUNT\nNuclei findings (deduped): $(wc -l < tmp/nuclei_results_dedup.txt || echo 0)\nFFUF result files: $(ls tmp/ffuf 2>/dev/null | wc -l || echo 0)"
-          curl -s -X POST -H 'Content-Type: application/json' -d "$(jq -n --arg s "$SUMMARY" '{content: $s}')" "${{ env.DISCORD_WEBHOOK }}" || true
+          MSG="✅ Scan complete for $DOMAIN\nSubdomains: $SUBS\nAlive: $ALIVE\nFindings: $NUCLEI"
+          curl -X POST -H "Content-Type: application/json" \
+            -d "{\"content\":\"$MSG\"}" "${{ env.DISCORD_WEBHOOK }}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: scan-results-${{ github.run_id }}
-          path: |
-            tmp/subdomains.txt
-            tmp/urls.txt
-            tmp/urls_alive.txt
-            tmp/nuclei_results.txt
-            tmp/nuclei_results_dedup.txt
-            tmp/ffuf
+          name: scan-results
+          path: tmp/
