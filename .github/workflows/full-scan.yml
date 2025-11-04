@@ -1,4 +1,4 @@
-name: Full Asset Discovery, Vulnerability Scan & Fuzz (amass active + ffuf)
+name: full-scan
 
 on:
   workflow_dispatch:
