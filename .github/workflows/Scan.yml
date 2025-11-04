@@ -1,0 +1,129 @@
+name: Full Asset Discovery, Vulnerability Scan & Fuzz (amass active + ffuf)
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Domain to scan (e.g. example.com)'
+        required: true
+        default: 'example.com'
+  schedule:
+    - cron: '0 6 * * 1'  # weekly on Monday 06:00 UTC
+
+env:
+  GOPATH: /github/home/go
+  GOBIN: /github/home/go/bin
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Ensure GOBIN in PATH
+        run: echo "${{ env.GOBIN }}" >> $GITHUB_PATH
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl unzip python3-pip git
+          pip3 install --user jq-cli-wrapper || true
+          GO111MODULE=on go install -v github.com/OWASP/Amass/v3/...@latest || true
+          GO111MODULE=on go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || true
+          GO111MODULE=on go install -v github.com/tomnomnom/assetfinder@latest || true
+          GO111MODULE=on go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest || true
+          GO111MODULE=on go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest || true
+          GO111MODULE=on go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
+          GO111MODULE=on go install -v github.com/ffuf/ffuf@latest || true
+          # tools should now be in $GOBIN
+          ls -1 ${GOBIN} || true
+
+      - name: Validate secrets + authorization
+        run: |
+          # Must set DISCORD_WEBHOOK and SCAN_AUTH=AUTHORIZED in repo secrets before running
+          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "::error::DISCORD_WEBHOOK secret is not set"
+            exit 1
+          fi
+          if [ "${{ secrets.SCAN_AUTH }}" != "AUTHORIZED" ]; then
+            echo "::error::You MUST set repository secret SCAN_AUTH to value: AUTHORIZED to confirm you have written permission to scan the target."
+            exit 1
+          fi
+          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
+          echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
+
+      - name: Notify start (with legal warning)
+        run: |
+          SUMMARY="🔍 **Scan started** for $DOMAIN\n**WARNING:** This job may perform noisy actions (amass active, ffuf fuzzing). Ensure you have written authorization."
+          curl -s -X POST -H "Content-Type: application/json" -d "$(jq -n --arg s "$SUMMARY" '{content: $s}')" "${{ env.DISCORD_WEBHOOK }}" || true
+
+      - name: Gather subdomains & endpoints (active + passive)
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+          bash scripts/gather_subs_and_urls.sh "$DOMAIN" tmp/subdomains.txt tmp/urls.txt tmp/amass_active_notice.txt
+
+      - name: Filter alive hosts & gather final url list
+        run: |
+          set -euo pipefail
+          mkdir -p tmp
+          sort -u tmp/subdomains.txt > tmp/subs_uniq.txt || true
+          # HTTPX probe for alive hosts and collect URL list
+          cat tmp/urls.txt tmp/subs_uniq.txt | sort -u > tmp/all_targets_raw.txt
+          # feed to httpx to get alive URLs (and status)
+          cat tmp/all_targets_raw.txt | ${GOBIN}/httpx -silent -threads 50 -status-code -title -o tmp/httpx_results.txt || true
+          # Extract URL column (httpx output is url|status... but to be safe use raw input where possible)
+          # Keep a list of clean URLs for nuclei/ffuf
+          awk '{print $1}' tmp/httpx_results.txt | sort -u > tmp/urls_alive.txt || true
+          wc -l tmp/urls_alive.txt || true
+
+      - name: Run Nuclei (update templates first)
+        run: |
+          set -euo pipefail
+          ${GOBIN}/nuclei -ut || true
+          if [ -s tmp/urls_alive.txt ]; then
+            ${GOBIN}/nuclei -l tmp/urls_alive.txt -severity critical,high,medium -o tmp/nuclei_results.txt -c 50 || true
+          else
+            echo "No alive URLs for nuclei" > tmp/nuclei_results.txt
+          fi
+
+      - name: Extract sensitive endpoints & run ffuf fuzzing (noisy)
+        run: |
+          set -euo pipefail
+          # WARNING: FFUF fuzzing is noisy. We require explicit authorization (see SCAN_AUTH).
+          mkdir -p tmp/ffuf
+          bash scripts/run_ffuf_on_sensitive.sh tmp/urls_alive.txt tmp/ffuf || true
+
+      - name: Postprocess & dedupe results
+        run: |
+          set -euo pipefail
+          bash scripts/postprocess.sh tmp || true
+
+      - name: Notify summary & artifacts
+        run: |
+          set -euo pipefail
+          NUCLEI_COUNT=$(cat tmp/nuclei_results_dedup.txt 2>/dev/null | wc -l || echo 0)
+          FFUF_SUMMARY=$(ls tmp/ffuf/*.json 2>/dev/null | wc -l || echo 0)
+          SUMMARY="📊 Scan summary for $DOMAIN\nSubdomains: $(wc -l < tmp/subdomains.txt || echo 0)\nAlive URLs: $(wc -l < tmp/urls_alive.txt || echo 0)\nNuclei findings (deduped): $NUCLEI_COUNT\nFFUF results files: $FFUF_SUMMARY"
+          curl -s -X POST -H "Content-Type: application/json" -d "$(jq -n --arg s "$SUMMARY" '{content: $s}')" "${{ env.DISCORD_WEBHOOK }}" || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-${{ github.run_id }}
+          path: |
+            tmp/subdomains.txt
+            tmp/urls.txt
+            tmp/urls_alive.txt
+            tmp/nuclei_results.txt
+            tmp/nuclei_results_dedup.txt
+            tmp/ffuf/*.json
