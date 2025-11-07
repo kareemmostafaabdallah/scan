@@ -1,84 +1,47 @@
-      - name: Install sqlmap
+name: Install sqlmap
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  install-sqlmap:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install prerequisites
         run: |
           set -e
-          # clone latest sqlmap (lightweight)
-          if [ ! -d sqlmap ]; then
-            git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git
-          fi
+          sudo apt-get update -y
+          sudo apt-get install -y git python3 python3-venv python3-pip
 
-      - name: Prepare SQLi candidate URLs
+      - name: Clone sqlmap repository
         run: |
           set -e
-          WAY_FILE="${{ env.WAYMORE_RESULTS_FILE }}"
-          SQL_CAND="sqli-candidates_${{ env.WORK_PREFIX }}.txt"
-          # take only URLs that contain a query string (has '?') — suitable for sqlmap
-          if [ -s "$WAY_FILE" ]; then
-            grep -E '\?.+' "$WAY_FILE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sort -u > "$SQL_CAND" || true
-          else
-            touch "$SQL_CAND"
-          fi
-          # optionally show count
-          echo "SQLI_CANDIDATES_FILE=$SQL_CAND" >> $GITHUB_ENV
-          CCOUNT=$(wc -l < "$SQL_CAND" || echo 0)
-          echo "SQLI_CANDIDATES_COUNT=$CCOUNT" >> $GITHUB_ENV
+          rm -rf /tmp/sqlmap
+          git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /tmp/sqlmap
 
-      - name: Notify SQLi Candidates
-        run: |
-          MSG="🧪 **SQLi Scan Starting**\n**Domain:** ${{ env.DOMAIN }}\n**Candidates:** ${{ env.SQLI_CANDIDATES_COUNT }}\n**File:** ${{ env.SQLI_CANDIDATES_FILE }}"
-          curl -s -X POST -H "Content-Type: application/json" \
-            -d "{\"content\": $(echo "$MSG" | jq -Rs .)}" \
-            "${{ env.DISCORD_WEBHOOK }}" || true
-
-      - name: Run sqlmap (non-interactive) on candidates
+      - name: Install sqlmap to /usr/local/bin
         run: |
           set -e
-          SQL_CAND="${{ env.SQLI_CANDIDATES_FILE }}"
-          OUTDIR="sqlmap_results_${{ env.WORK_PREFIX }}"
-          mkdir -p "$OUTDIR"
-          # Safety: use moderate risk/level; --batch to avoid prompts
-          if [ -s "$SQL_CAND" ]; then
-            while IFS= read -r target || [ -n "$target" ]; do
-              [ -z "$target" ] && continue
-              echo "🔎 sqlmap scanning: $target"
-              # parameters:
-              # --batch -> non-interactive
-              # --risk / --level -> tune intensity (1-3)
-              # --threads -> speed up (concurrency)
-              # --timeout -> adjust if many slow requests
-              # --output-dir -> store results per run
-              python3 sqlmap/sqlmap.py -u "$target" --batch --risk=2 --level=2 --threads=5 --timeout=10 --output-dir="$OUTDIR" || true
-              # small random sleep to reduce burst load
-              sleep $((RANDOM % 3 + 1))
-            done < "$SQL_CAND"
-          else
-            echo "No SQLi candidate URLs found, skipping sqlmap."
-          fi
-          echo "SQLMAP_OUTPUT_DIR=$OUTDIR" >> $GITHUB_ENV
+          sudo ln -sf /tmp/sqlmap/sqlmap.py /usr/local/bin/sqlmap
+          sudo chmod +x /usr/local/bin/sqlmap
 
-      - name: Summarize sqlmap results & notify
+      - name: Verify sqlmap installation
         run: |
-          OUTDIR="${{ env.SQLMAP_OUTPUT_DIR:-sqlmap_results_${{ env.WORK_PREFIX }}}}"
-          # count files that sqlmap writes under output dir
-          if [ -d "$OUTDIR" ]; then
-            # sqlmap stores output in <outdir>/<target-host>/... ; count folder entries mentioning "sqli" or "xml" or "log"
-            FOUND=$(find "$OUTDIR" -type f -iname "*.xml" -o -iname "*.txt" -o -iname "*.log" 2>/dev/null | wc -l || echo 0)
+          set -e
+          if command -v sqlmap >/dev/null 2>&1; then
+            echo "sqlmap found at: $(command -v sqlmap)"
+            sqlmap --version
           else
-            FOUND=0
+            echo "sqlmap not found in PATH"
+            ls -la /tmp/sqlmap || true
+            exit 1
           fi
-
-          if [ "$FOUND" -gt 0 ]; then
-            MESSAGE="🚨 **sqlmap Results**\n**Domain:** ${{ env.DOMAIN }}\n**Artifacts:** $OUTDIR\n**Potential result files:** $FOUND\n(Review the output artifacts in the workflow run.)"
-          else
-            MESSAGE="✅ **sqlmap Complete**\n**Domain:** ${{ env.DOMAIN }}\nNo result files detected (no SQLi confirmed)."
-          fi
-
-          curl -s -X POST -H "Content-Type: application/json" \
-            -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" \
-            "${{ env.DISCORD_WEBHOOK }}" || true
-
-      - name: Upload sqlmap Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: sqlmap-results-${{ env.WORK_PREFIX }}
-          path: |
-            sqlmap_results_${{ env.WORK_PREFIX }}
