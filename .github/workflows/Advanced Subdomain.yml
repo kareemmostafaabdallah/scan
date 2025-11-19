@@ -1,0 +1,151 @@
+name: Advanced Subdomain & Vulnerability Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'الدومين المسموح لك بفحصه (مثل: yourcompany.com)'
+        required: true
+        type: string
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ────── 1. التحقق من الدومين المسموح ──────
+      - name: Domain Authorization Check
+        run: |
+          ALLOWED_DOMAINS="yourcompany.com|client1.com|client2.com|anotherclient.org"
+          DOMAIN="${{ inputs.domain }}"
+
+          if [[ ! "$DOMAIN" =~ ^($ALLOWED_DOMAINS)$ ]]; then
+            echo "رفض السكان: الدومين '$DOMAIN' غير مسموح"
+            exit 1
+          fi
+
+          echo "تم قبول الدومين: $DOMAIN"
+          echo "TARGET=$DOMAIN" >> $GITHUB_ENV
+
+      # ────── 2. إعداد الأدوات (أحدث إصدارات 2025) ──────
+      - name: Install Latest Tools
+        run: |
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/projectdiscovery/katana/cmd/katana@latest
+          sudo apt-get update -qq && sudo apt-get install -y chromium-browser nmap jq
+
+      - name: Update Nuclei Templates
+        run: nuclei -update-templates -silent
+
+      # ────── 3. بدء السكان + إشعار ديسكورد ──────
+      - name: Discord - Scan Started
+        run: |
+          curl -X POST -H "Content-Type: application/json" "${{ secrets.DISCORD_WEBHOOK }}" -d '{
+            "embeds": [{
+              "title": "بدء سكان أمني جديد",
+              "description": "**الدومين:** `${{ env.TARGET }}`\n**وقت البدء:** <t:$(date +%s):F>\n**المشغل:** ${{ github.actor }}",
+              "color": 3447003,
+              "footer": { "text": "Subfinder → HTTPX → Nuclei → Katana (اختياري)" }
+            }]
+          }'
+
+      # ────── 4. Subfinder + إزالة الدوبلكيت ──────
+      - name: Subfinder Enumeration
+        run: |
+          subfinder -d ${{ env.TARGET }} -all -silent -o subdomains_raw.txt
+          sort -u subdomains_raw.txt -o subdomains.txt
+          echo "SUBDOMAINS=$(wc -l < subdomains.txt)" >> $GITHUB_ENV
+
+      # ────── 5. HTTPX لفلترة المواقع الحية فقط ──────
+      - name: Probe Live Hosts
+        run: |
+          httpx -l subdomains.txt -silent -threads 200 -o alive.txt
+          echo "ALIVE=$(wc -l < alive.txt)" >> $GITHUB_ENV
+
+      # ────── 6. Nuclei سكان قوي (كل السيفيرتي) ──────
+      - name: Nuclei Scan (Critical → Low)
+        run: |
+          nuclei -l alive.txt -severity critical,high,medium,low -concurrency 50 -bulk-size 25 -c 100 -silent -jsonl -o nuclei.jsonl
+          # تحويل إلى نص عادي للعرض
+          cat nuclei.jsonl | jq -r '"[\(.info.severity)] \(.template-id) → \(.matched-at)"' > nuclei.txt 2>/dev/null || true
+          echo "VULNS=$(wc -l < nuclei.txt)" >> $GITHUB_ENV
+
+      # ────── 7. (اختياري) Katana Crawling على المهم ──────
+      - name: Katana Crawl (Top 50 only)
+        if: env.ALIVE > 5
+        run: |
+          head -50 alive.txt | katana -silent -c 20 -d 5 -o katana-endpoints.txt || true
+
+      # ────── 8. إشعارات ديسكورد احترافية جدًا ──────
+      - name: Discord - Summary Report
+        run: |
+          CRITICAL=$(grep -ic "critical" nuclei.txt || echo 0)
+          HIGH=$(grep -ic "high" nuclei.txt || echo 0)
+          MEDIUM=$(grep -ic "medium" nuclei.txt || echo 0)
+
+          COLOR=3066993  # أخضر
+          [[ $CRITICAL -gt 0 ]] && COLOR=15158332  # أحمر
+          [[ $HIGH -gt 0 && $CRITICAL -eq 0 ]] && COLOR=15105570 # برتقالي
+
+          curl -X POST -H "Content-Type: application/json" "${{ secrets.DISCORD_WEBHOOK }}" -d @- << EOF
+          {
+            "embeds": [{
+              "title": "انتهى السكان بنجاح",
+              "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "description": "**الدومين:** \`${{ env.TARGET }}\`\n**إجمالي السابدومين:** ${{ env.SUBDOMAINS }}\n**الحية:** ${{ env.ALIVE }}\n**الثغرات المكتشفة:** ${{ env.VULNS }}",
+              "color": $COLOR,
+              "fields": [
+                { "name": "Critical", "value": "$CRITICAL", "inline": true },
+                { "name": "High", "value": "$HIGH", "inline": true },
+                { "name": "Medium+", "value": "$MEDIUM", "inline": true }
+              ],
+              "footer": { "text": "انقر على العنوان لرؤية الـ Run كامل" },
+              "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            }]
+          }
+          EOF
+
+      # ────── 9. إرسال كل ثغرة في إمبد منفصل (جميل جدًا) ──────
+      - name: Discord - Send Individual Vulnerabilities
+        if: env.VULNS > 0
+        run: |
+          cat nuclei.jsonl | jq -r '. | 
+            {
+              embeds: [{
+                title: .template-id,
+                description: "**Severity:** `" + .info.severity + "`\n**Host:** `" + .matched-at + "`\n**Name:** " + .info.name,
+                color: (if .info.severity == "critical" then 15158332
+                        elif .info.severity == "high" then 15105570
+                        elif .info.severity == "medium" then 16763904
+                        else 3447003 end),
+                fields: [
+                  { name: "Extractor", value: "\(.extracted-results // [\"None\"])[0] // \"-\"", inline: false },
+                  { name: "Info", value: "[ProjectDiscovery Nuclei](https://nuclei.projectdiscovery.io)", inline: true }
+                ],
+                timestamp: .timestamp
+              }]
+            } | @json' | while read payload; do
+            curl -X POST -H "Content-Type: application/json" "${{ secrets.DISCORD_WEBHOOK }}" -d "$payload"
+            sleep 1.5
+          done
+
+      # ────── 10. رفع النتايج كـ Artifacts ──────
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: "scan-${{ env.TARGET }}-${{ github.run_id }}"
+          path: |
+            subdomains.txt
+            alive.txt
+            nuclei.txt
+            nuclei.jsonl
+            katana-endpoints.txt
+          retention-days: 7
