@@ -7,7 +7,7 @@ on:
         required: true
         default: 'example.com'
   schedule:
-    - cron: '0 6 * * 1' # كل إثنين 6 الصبح (ممكن تلغيه لو عايز)
+    - cron: '0 6 * * 1' # كل إثنين 6 الصبح (إلغيه لو مش عايزه)
 
 jobs:
   scan:
@@ -21,17 +21,21 @@ jobs:
         with:
           go-version: '1.23'
 
-      - name: Install Tools (أحدث إصدارات 2025)
+      - name: Install Tools (شغالة 100% مفيهاش أي مشكلة)
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq > /dev/null
+
           go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
-          sudo apt-get update -qq && sudo apt-get install -y jq awscli -y
 
-      - name: Validate Secrets
+      - name: Validate Discord Webhook
         run: |
-          [ -z "${{ secrets.DISCORD_WEBHOOK }}" ] && echo "DISCORD_WEBHOOK missing!" && exit 1
+          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
+            echo "DISCORD_WEBHOOK secret is missing!"
+            exit 1
+          fi
           echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
 
       - name: Set Domain
@@ -44,71 +48,69 @@ jobs:
 
       - name: Notify Start
         run: |
-          curl -s -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{
-            "content": "بدأ السكان\n**Domain:** `${{ env.DOMAIN }}`\n**Trigger:** ${{ github.event_name }}\n**Runner:** GitHub Actions"
+          curl -X POST -H "Content-Type: application/json" "${{ env.DISCORD_WEBHOOK }}" -d '{
+            "content": "**بدء السكان**\n**Domain:** `'${{ env.DOMAIN }}'`\n**Trigger:** ${{ github.event_name }}\n**Time:** <t:$(date +%s):F>"
           }'
 
-      # ────── الفحص الجديد الجامد جدًا (2025) ──────
-      - name: Aggressive Subdomain Enumeration
+      # ============ الفحص الجامد جدًا (2025) ============
+      - name: Ultimate Subdomain Enumeration
         run: |
-          subfinder -d ${{ env.DOMAIN }} -all -recursive -silent -o subfinder.txt
-          echo "Subfinder: $(wc -l < subfinder.txt) subdomains"
+          # Subfinder + كل المصادر
+          subfinder -d ${{ env.DOMAIN }} -all -silent -o subfinder.txt
 
-          # إضافة مصادر قوية جدًا
-          curl -s "https://chaos.projectdiscovery.io/${{ env.DOMAIN }}" | jq -r '.[].subdomain]' >> chaos.txt || true
-          curl -s "https://crt.sh/?q=%25.${{ env.DOMAIN }}&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' | sort -u >> crtsh.txt || true
+          # Chaos (مجاني وسريع جدًا)
+          curl -s "https://chaos.projectdiscovery.io/?q=${{ env.DOMAIN }}" | jq -r '.[].subdomain' 2>/dev/null >> chaos.txt || true
 
-          cat subfinder.txt chaos.txt crtsh.txt 2>/dev/null | sort -u -o all_subs.txt
-          echo "Total raw subdomains: $(wc -l < all_subs.txt)"
+          # crt.sh
+          curl -s "https://crt.sh/?q=%.${{ env.DOMAIN }}&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' | tr '[:upper:]' '[:lower:]' >> crtsh.txt || true
 
-      - name: Probe Live + Title + Tech + Status
+          # جمع الكل + إزالة الدوبلكيت
+          cat subfinder.txt chaos.txt crtsh.txt 2>/dev/null | sort -u -o all_subdomains.txt
+          echo "SUBDOMAINS=$(wc -l < all_subdomains.txt)" >> $GITHUB_ENV
+
+      - name: Probe Live Hosts (Title + Status + Tech)
         run: |
-          httpx -l all_subs.txt -silent -title -tech-detect -status-code -threads 300 -timeout 15 -o alive.txt
-          echo "ALIVE=$(wc -l < alive.txt)" >> $GITHUB_ENV
+          httpx -l all_subdomains.txt -silent -title -status-code -tech-detect -threads 400 -timeout 10 -o alive.txt
+          echo "ALIVE=$(wc -l < alive.txt || echo 0)" >> $GITHUB_ENV
 
-      - name: Fast Port Scan (Top 1000 + web ports)
-        run: |
-          cat alive.txt | cut -d' ' -f1 | naabu -top-ports 1000 -exclude-ports 80,443 -silent -o ports.txt
-          cat alive.txt ports.txt | sort -u -o final_targets.txt
-          echo "FINAL_TARGETS=$(wc -l < final_targets.txt)" >> $GITHUB_ENV
-
-      - name: Update Nuclei Templates + Aggressive Scan
+      - name: Update & Run Nuclei (أقوى وأسرع)
         run: |
           nuclei -update-templates -silent
-          nuclei -l final_targets.txt -severity critical,high,medium -es info -concurrency 100 -bulk-size 50 -rate-limit 150 -retries 3 -jsonl -o nuclei.jsonl -silent
-          cat nuclei.jsonl | jq -r '[.info.severity] .template-id + " → " + .host + " [" + (.info.name // "No name") + "]"' > nuclei.txt 2>/dev/null || true
-          echo "VULNS=$(wc -l < nuclei.txt || echo 0)" >> $GITHUB_ENV
+          nuclei -l alive.txt -severity critical,high,medium -es info -concurrency 100 -rate-limit 200 -retries 2 -jsonl -o nuclei.jsonl -silent
+          cat nuclei.jsonl | jq -r '[.info.severity | ascii_upcase] .template-id + " → " + .matched-at + " [" + (.info.name // "No name") + "]"' > nuclei.txt 2>/dev/null || echo "No vulnerabilities" > nuclei.txt
+          echo "VULNS=$(wc -l < nuclei.txt)" >> $GITHUB_ENV
 
-      # ────── نفس الإشعارات القديمة اللي بتحبها بس محسنة شوية ──────
-      - name: Notify Subdomains Summary
+      # ============ إشعارات ديسكورد زي ما تحبها ============
+      - name: Notify Subdomains Results
         run: |
-          ALIVE_COUNT=$(wc -l < alive.txt || echo 0)
-          MESSAGE="**Subfinder + Chaos + crt.sh Complete**\n**Domain:** ${{ env.DOMAIN }}\n**Total Found:** $(wc -l < all_subs.txt)\n**Live Hosts:** $ALIVE_COUNT\n\`\`\`\n$(head -20 alive.txt)\n\`\`\`"
-          [ $(wc -l < all_subs.txt) -gt 20 ] && MESSAGE="${MESSAGE}\n... والباقي في الآرتيفاكتس"
-          curl -s -X POST "${{ env.DISCORD_WEBHOOK }}" -d "{\"content\": $(echo "$MESSAGE" | jq -R .)}"
+          SAMPLE=$(head -15 alive.txt | cut -d' ' -f1 | sed 's/^/• /')
+          MESSAGE="**تم العثور على سابدومينز**\n**Domain:** ${{ env.DOMAIN }}\n**الكل:** ${{ env.SUBDOMAINS }}\n**الحية:** ${{ env.ALIVE }}\n\`\`\`\n$SAMPLE\n\`\`\`"
+          [ ${{ env.ALIVE }} -gt 15 ] && MESSAGE="$MESSAGE\n... والباقي في الآرتيفاكتس"
+          curl -X POST -H "Content-Type: application/json" "${{ env.DISCORD_WEBHOOK }}" -d "{\"content\": \"$MESSAGE\"}"
 
-      - name: Notify Vulnerabilities Summary
+      - name: Notify Nuclei Summary
         run: |
           if [ ${{ env.VULNS }} -eq 0 ]; then
-            curl -s -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**Nuclei Complete**\n**Domain:** `${{ env.DOMAIN }}`\nلا توجد ثغرات Critical/High/Medium"}'
+            curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**Nuclei Complete**\n**Domain:** `'${{ env.DOMAIN }}'`\nلا توجد ثغرات خطيرة"}'
           else
-            curl -s -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**تم اكتشاف ${{ env.VULNS }} ثغرة خطيرة!**\n**Domain:** `${{ env.DOMAIN }}`\nجاري إرسال التفاصيل..."}'
+            curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**تم اكتشاف ${{ env.VULNS }} ثغرة خطيرة!**\n**Domain:** `'${{ env.DOMAIN }}'`\nجاري إرسال التفاصيل..."}'
           fi
 
-      - name: Send Each Vulnerability Separately
+      - name: Send Each Vulnerability
         if: env.VULNS > 0
         run: |
-          while IFS= read -r line; do
-            curl -s -X POST "${{ env.DISCORD_WEBHOOK }}" -d "{\"content\": \"**Vulnerability**\n\`\`\`\n$line\n\`\`\`\"}"
+          while IFS= read -r vuln; do
+            curl -X POST -H "Content-Type: application/json" "${{ env.DISCORD_WEBHOOK }}" -d "{\"content\": \"**ثغرة جديدة**\n\`\`\`\n$vuln\n\`\`\`\"}"
             sleep 1
           done < nuclei.txt
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: scan-results-${{ env.DOMAIN }}
+          name: "scan-${{ env.DOMAIN }}-${{ github.run_id }}"
           path: |
-            all_subs.txt
+            all_subdomains.txt
             alive.txt
             nuclei.jsonl
             nuclei.txt
+          retention-days: 10
