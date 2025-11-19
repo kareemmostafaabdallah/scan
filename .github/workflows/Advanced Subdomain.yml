@@ -4,200 +4,154 @@ on:
   workflow_dispatch:
     inputs:
       domain:
-        description: 'Target domain (e.g. wien.gv.at)'
+        description: 'Target domain'
         required: true
         default: 'example.com'
   schedule:
-    - cron: '0 9 * * 1'  # كل إثنين 9 صباحًا UTC
+    - cron: '0 9 * * 1'
 
 jobs:
-  ultimate-scan:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 ساعات كاملة عشان يخلّص براحته
-
-    # ──────── حماية قانونية ────────
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      contains('example.com tesla.com wien.gv.at', github.event.inputs.domain)
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Go (Latest)
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '>=1.23.0'
           cache: true
 
-      - name: Install All Tools (Fixed PATH 100%)
+      # ──────── تثبيت الأدوات بدون أي مشاكل pcap.h أبدًا ────────
+      - name: Install Tools (Clean & Working 100%)
         run: |
           go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
           go install -v github.com/projectdiscovery/katana/cmd/katana@latest
           go install -v github.com/tomnomnom/assetfinder@latest
-          go install -v github.com/OWASP/Amass/v3/...@master
 
+          # إضافة Go bin للـ PATH
           echo "$HOME/go/bin" >> $GITHUB_PATH
 
-          # Findomain + Amass binary
+          # Findomain فقط (بدون naabu ولا amass عشان ما يجيبش pcap error)
           curl -sLO https://github.com/Findomain/Findomain/releases/latest/download/findomain-linux.zip
-          unzip -o findomain-linux.zip && chmod +x findomain && sudo mv findomain /usr/local/bin/
+          unzip -o findomain-linux.zip
+          chmod +x findomain
+          sudo mv findomain /usr/local/bin/
 
+          # أدوات إضافية خفيفة
           sudo apt-get update -qq
-          sudo apt-get install -y jq nmap chromium-browser
+          sudo apt-get install -y jq
 
-      - name: Validate Discord Webhook
+      - name: Validate Webhook
         run: |
           [[ -z "${{ secrets.DISCORD_WEBHOOK }}" ]] && echo "::error::DISCORD_WEBHOOK missing!" && exit 1
 
       - name: Set Target
         run: |
-          DOMAIN="${{ github.event.inputs.domain || 'example.com' }}"
-          echo "TARGET=$DOMAIN" >> $GITHUB_ENV
-          echo "START_TIME=$(date -u)" >> $GITHUB_ENV
+          echo "TARGET=${{ github.event.inputs.domain || 'example.com' }}" >> $GITHUB_ENV
 
       - name: Notify Start
         run: |
           curl -X POST -H "Content-Type: application/json" ${{ secrets.DISCORD_WEBHOOK }} -d '{
-            "embeds": [{
-              "title": "Ultimate Scan Started",
-              "description": "**Target:** `'${{ env.TARGET }}'`\n**Mode:** Maximum Accuracy (6h timeout)\n**Start:** `'$(date -u +"%Y-%m-%d %H:%M UTC")'`",
-              "color": 16745728
-            }]
+            "embeds": [{"title": "Scan Started", "description": "**Target:** `'${{ env.TARGET }}'`\nMaximum Accuracy Mode", "color": 16745728}]
           }'
 
-      # ──────── أقوى Subdomain Enumeration في التاريخ ────────
+      # ──────── أقوى Recon بدون أي أخطاء ────────
       - name: Ultimate Subdomain Enumeration
         run: |
-          echo "[+] Running the strongest recon ever..."
-
           subfinder -d ${{ env.TARGET }} -all -recursive -silent -o s1.txt
           assetfinder --subs-only ${{ env.TARGET }} > s2.txt
           findomain -t ${{ env.TARGET }} -q > s3.txt
-          amass enum -passive -d ${{ env.TARGET }} -o s4.txt
-          curl -s "https://crt.sh/?q=%25.${{ env.TARGET }}&output=json" | jq -r '.[].name_value' | sort -u > s5.txt
-          curl -s "https://dns.bufferover.run/dns?q=${{ env.TARGET }}" | jq -r '.FDNS_A[],.FDNS_CNAME[]?' 2>/dev/null | cut -d',' -f2 | sort -u > s6.txt
-          curl -s "https://rapiddns.io/subdomain/${{ env.TARGET }}?full=1" | grep -oE '[a-zA-Z0-9._-]+\.${{ env.TARGET }}' | sort -u > s7.txt
-          curl -s "https://riddler.io/search/exportcsv?q=pld:${{ env.TARGET }}" | grep -oE '[a-zA-Z0-9._-]+\.${{ env.TARGET }}' | sort -u > s8.txt || true
+          curl -s "https://crt.sh/?q=%25.${{ env.TARGET }}&output=json" | jq -r '.[].name_value' | sort -u > s4.txt
+          curl -s "https://dns.bufferover.run/dns?q=${{ env.TARGET }}" | jq -r '.FDNS_A[]?' 2>/dev/null | cut -d',' -f2 | sort -u > s5.txt
+          curl -s "https://rapiddns.io/subdomain/${{ env.TARGET }}?full=1" | grep -oE '[a-zA-Z0-9._-]+\.${{ env.TARGET }}' | sort -u > s6.txt
 
-          cat s*.txt 2>/dev/null | sort -u | grep -v '*' | anew all-subdomains.txt
+          cat s*.txt | sort -u | grep -v '*' > all-subdomains.txt
           echo "TOTAL_RAW=$(wc -l < all-subdomains.txt)" >> $GITHUB_ENV
 
-      - name: Resolve & Probe (Ultra Accurate)
+      - name: Probe Alive Hosts
         run: |
-          httpx -l all-subdomains.txt \
-            -title -status-code -tech-detect -ip -cdn -threads 500 \
-            -timeout 20 -follow-redirects -o alive.txt
+          httpx -l all-subdomains.txt -silent -threads 500 -timeout 20 -follow-redirects -title -status-code -o alive.txt
+          echo "ALIVE_COUNT=$(wc -l < alive.txt || echo 0)" >> $GITHUB_ENV
 
-          echo "ALIVE_COUNT=$(wc -l < alive.txt)" >> $GITHUB_ENV
-
-      - name: Notify Recon Results
+      - name: Notify Recon Summary
         run: |
           curl -X POST -H "Content-Type: application/json" ${{ secrets.DISCORD_WEBHOOK }} -d '{
             "embeds": [{
               "title": "Recon Complete",
               "fields": [
-                {"name": "Target", "value": "${{ env.TARGET }}"},
-                {"name": "Total Subdomains", "value": "${{ env.TOTAL_RAW }}"},
-                {"name": "Alive & Resolved", "value": "${{ env.ALIVE_COUNT }}"}
-              ],
-              "color": 3066993
+                {"name": "Total", "value": "${{ env.TOTAL_RAW }}", "inline": true},
+                {"name": "Alive", "value": "${{ env.ALIVE_COUNT }}", "inline": true}
+              ], "color": 3066993
             }]
           }'
-          [[ ${{ env.ALIVE_COUNT }} -gt 0 ]] && head -30 alive.txt > top30.txt && curl -F "file=@top30.txt" -F "content=Top 30 Alive Subdomains" ${{ secrets.DISCORD_WEBHOOK }}
 
-      - name: Update Nuclei Templates (Full)
+      - name: Update Nuclei Templates
         run: nuclei -update-templates -silent
 
-      # ──────── أقوى Nuclei Scan في الوجود (جودة > سرعة) ────────
-      - name: Ultimate Nuclei Scan (Max Detection)
+      # ──────── Nuclei بأقوى إعدادات بدون أي إلغاء أو تحذير ────────
+      - name: Ultimate Nuclei Scan (No Cancel, Max Results)
         run: |
-          echo "[+] Starting the deepest Nuclei scan..."
-
           nuclei -l alive.txt \
             -severity critical,high,medium,low,info \
-            -t ~/.config/nuclei/templates/ \
             -c 40 \
             -bulk-size 20 \
-            -rate-limit 100 \
+            -rate-limit 80 \
             -retries 5 \
-            -timeout 15 \
-            -headless-bulk-size 10 \
-            -enable-passive \
+            -timeout 20 \
             -jsonl \
             -o nuclei.jsonl \
             -silent || true
 
           [ ! -f nuclei.jsonl ] && touch nuclei.jsonl
-          VULN_COUNT=$(jq -c . nuclei.jsonl 2>/dev/null | wc -l || echo 0)
+          VULN_COUNT=$(wc -l < nuclei.jsonl || echo 0)
           echo "VULN_COUNT=$VULN_COUNT" >> $GITHUB_ENV
 
-      - name: Send All Vulnerabilities (Beautiful + No Rate Limit)
+      - name: Send Vulnerabilities
         if: env.VULN_COUNT > 0
         run: |
           jq -c . nuclei.jsonl | while read v; do
             sev=$(echo "$v" | jq -r '.info.severity // "info"')
-            name=$(echo "$v" | jq -r '.info.name')
+            name=$(echo "$v" | jq -r '.info.name // "Unknown"')
             tmp=$(echo "$v" | jq -r '.template-id')
             url=$(echo "$v" | jq -r '."matched-at" // .host')
-            ext=$(echo "$v" | jq -r '.extracted-results // [] | join(" | ")')
 
-            case $sev in
-              critical) color=15158332 ;;
-              high)     color=15105570 ;;
-              medium)   color=16763904 ;;
-              low)      color=4437377  ;;
-              *)        color=10181046 ;;
-            esac
+            case $sev in critical) c=15158332;; high) c=15105570;; medium) c=16763904;; *) c=10181046;; esac
 
             curl -X POST -H "Content-Type: application/json" ${{ secrets.DISCORD_WEBHOOK }} -d "{
               \"embeds\": [{
                 \"title\": \"${name:0:250}\",
-                \"url\": \"$url\",
-                \"description\": \"`$tmp\`\n\`\`\`$url\`\`\`\",
-                \"color\": $color,
-                \"fields\": [
-                  {\"name\": \"Severity\", \"value\": \"${sev^}\", \"inline\": true},
-                  {\"name\": \"Extracted\", \"value\": \"${ext:0:1000}\" \"||\" \"None\", \"inline\": false}
-                ],
-                \"footer\": {\"text\": \"${{ env.TARGET }} • Ultimate Scan\"}
+                \"description\": \"\`$tmp\`\n\`$url\`\",
+                \"color\": $c,
+                \"fields\": [{\"name\": \"Severity\", \"value\": \"${sev^}\", \"inline\": true}]
               }]
             }"
             sleep 1.5
           done
 
-      - name: No Vulnerabilities Found
+      - name: No Vulns
         if: env.VULN_COUNT == '0'
         run: |
           curl -X POST -H "Content-Type: application/json" ${{ secrets.DISCORD_WEBHOOK }} -d '{
-            "embeds": [{
-              "title": "Clean! No Vulnerabilities Detected",
-              "description": "Nuclei scanned everything and found zero issues.",
-              "color": 5763719
-            }]
+            "embeds": [{"title": "Clean Result", "description": "No vulnerabilities found", "color": 5763719}]
           }'
 
-      - name: Upload Full Results
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: ULTIMATE-${{ env.TARGET }}-$(date +%Y%m%d-%H%M%S)
+          name: ${{ env.TARGET }}-ULTIMATE-$(date +%Y%m%d-%H%M%S)
           path: |
             all-subdomains.txt
             alive.txt
             nuclei.jsonl
-            top30.txt
 
-      - name: Final Report
+      - name: Final Notification
         run: |
-          END_TIME=$(date -u)
           curl -X POST -H "Content-Type: application/json" ${{ secrets.DISCORD_WEBHOOK }} -d '{
-            "embeds": [{
-              "title": "Ultimate Scan Finished",
-              "description": "**Target:** ${{ env.TARGET }}\n**Alive:** ${{ env.ALIVE_COUNT }}\n**Vulnerabilities:** ${{ env.VULN_COUNT }}\n**Duration:** ~6 hours max\n**Results:** Downloaded as artifact",
-              "color": 5793266,
-              "timestamp": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
-            }]
+            "embeds": [{"title": "Scan Finished", "description": "**Target:** ${{ env.TARGET }}\n**Vulns:** ${{ env.VULN_COUNT }}\nCheck artifacts!", "color": 5793266}]
           }'
