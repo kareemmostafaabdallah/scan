@@ -28,7 +28,7 @@ jobs:
 
       - name: Check Discord Webhook
         run: |
-          [ -z "${{ secrets.DISCORD_WEBHOOK }}" ] && echo "Add DISCORD_WEBHOOK secret" && exit 1
+          [ -z "${{ secrets.DISCORD_WEBHOOK }}" ] && echo "Add DISCORD_WEBHOOK secret!" && exit 1
           echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
 
       - name: Set Domain
@@ -45,12 +45,12 @@ jobs:
           cat subfinder.txt chaos.txt crtsh.txt 2>/dev/null | sort -u -o all.txt
           echo "SUBS=$(wc -l < all.txt)" >> $GITHUB_ENV
 
-      - name: Probe Live
+      - name: Probe Live Hosts
         run: |
           httpx -l all.txt -silent -title -status-code -threads 300 -timeout 10 -o alive.txt
           echo "ALIVE=$(wc -l < alive.txt || echo 0)" >> $GITHUB_ENV
 
-      - name: Nuclei Scan (بدون أي غلطة)
+      - name: Nuclei Scan
         run: |
           nuclei -update-templates -silent
           nuclei -l alive.txt -severity critical,high,medium -es info -c 50 -rl 150 -retries 2 -jsonl -o nuclei.jsonl -silent
@@ -59,7 +59,7 @@ jobs:
 
       - name: Notify Subdomains
         run: |
-          SAMPLE=$(head -25 alive.txt | cut -d' ' -f1 | sed 's/^/• /')
+          SAMPLE=$(head -25 alive.txt | cut -d' ' -f1 | sed 's/^/• /' | tr '\n' '\n')
           curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d "{\"content\": \"**Subdomains الحية**\n**Domain:** ${{ env.DOMAIN }}\n**Total:** ${{ env.SUBS }} | **Live:** ${{ env.ALIVE }}\n\`\`\`\n$SAMPLE\n\`\`\`\"}"
 
       - name: Notify Vulnerabilities Summary
@@ -79,10 +79,9 @@ jobs:
           done < nuclei.txt
 
       - name: Final Message
-        run: |
-          curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**السكان انتهى تمامًا**\n**Domain:** `'${{ env.DOMAIN }}'`\n**Live:** ${{ env.ALIVE }} | **Vulns:** ${{ env.VULNS }}\nرابط الـ Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
+        run: curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**السكان انتهى**\n**Domain:** `'${{ env.DOMAIN }}'`\n**Live:** ${{ env.ALIVE }} | **Vulns:** ${{ env.VULNS }}\nرابط: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
 
-      - name: Upload Artifacts
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
           name: scan-${{ env.DOMAIN }}
