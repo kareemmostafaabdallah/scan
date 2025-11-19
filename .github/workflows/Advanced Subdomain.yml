@@ -1,4 +1,4 @@
-name: Subdomain & Vulnerability Scanner
+name: Advanced Subdomain
 on:
   workflow_dispatch:
     inputs:
