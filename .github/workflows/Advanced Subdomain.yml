@@ -1,150 +1,114 @@
 name: Advanced Subdomain
-
 on:
   workflow_dispatch:
     inputs:
       domain:
-        description: 'الدومين اللي عايز تفحصه (مثل: target.com)'
+        description: 'Domain to scan'
         required: true
-        type: string
+        default: 'example.com'
+  schedule:
+    - cron: '0 6 * * 1' # كل إثنين 6 الصبح (ممكن تلغيه لو عايز)
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      # ────── 1. التحقق من الدومين مقابل الـ Secret ──────
-      - name: Domain Authorization Check
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.23'
+
+      - name: Install Tools (أحدث إصدارات 2025)
         run: |
-          ALLOWED="${{ secrets.ALLOWED_DOMAINS }}"
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+          sudo apt-get update -qq && sudo apt-get install -y jq awscli -y
 
-          if [[ -z "$ALLOWED" ]]; then
-            echo "❌ لازم تضيف secret اسمه ALLOWED_DOMAINS في الـ Settings"
-            exit 1
-          fi
+      - name: Validate Secrets
+        run: |
+          [ -z "${{ secrets.DISCORD_WEBHOOK }}" ] && echo "DISCORD_WEBHOOK missing!" && exit 1
+          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
 
-          DOMAIN="${{ inputs.domain }}"
-          if echo "$DOMAIN" | grep -E "^($ALLOWED)$" >/dev/null; then
-            echo "✅ الدومين مسموح: $DOMAIN"
-            echo "TARGET=$DOMAIN" >> $GITHUB_ENV
+      - name: Set Domain
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "DOMAIN=${{ inputs.domain }}" >> $GITHUB_ENV
           else
-            echo "🚫 الدومين '$DOMAIN' غير مسموح!"
-            echo "المسموح حاليًا: $ALLOWED"
-            exit 1
+            echo "DOMAIN=example.com" >> $GITHUB_ENV
           fi
 
-      # ────── 2. تجهيز الأدوات ──────
-      - name: Install Tools
+      - name: Notify Start
         run: |
-          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-          sudo apt-get update -qq && sudo apt-get install -y jq
-
-      - name: Update Nuclei Templates
-        run: nuclei -update-templates -silent
-
-      # ────── 3. إشعار البداية على ديسكورد ──────
-      - name: Discord → Scan Started
-        run: |
-          curl -X POST -H "Content-Type: application/json" "${{ secrets.DISCORD_WEBHOOK }}" -d '{
-            "embeds": [{
-              "title": "بدء سكان أمني جديد",
-              "description": "**الدومين:** `'${{ env.TARGET }}'`\n**بواسطة:** ${{ github.actor }}\n**وقت البدء:** <t:$(date +%s):F>",
-              "color": 3447003,
-              "thumbnail": { "url": "https://i.imgur.com/8YghQ.jpg" }
-            }]
+          curl -s -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{
+            "content": "بدأ السكان\n**Domain:** `${{ env.DOMAIN }}`\n**Trigger:** ${{ github.event_name }}\n**Runner:** GitHub Actions"
           }'
 
-      # ────── 4. Subfinder ──────
-      - name: Subfinder Enumeration
+      # ────── الفحص الجديد الجامد جدًا (2025) ──────
+      - name: Aggressive Subdomain Enumeration
         run: |
-          subfinder -d ${{ env.TARGET }} -all -silent -o subdomains_raw.txt
-          sort -u subdomains_raw.txt -o subdomains.txt
-          echo "SUBDOMAINS=$(wc -l < subdomains.txt)" >> $GITHUB_ENV
+          subfinder -d ${{ env.DOMAIN }} -all -recursive -silent -o subfinder.txt
+          echo "Subfinder: $(wc -l < subfinder.txt) subdomains"
 
-      # ────── 5. HTTPX → الحية بس ──────
-      - name: Probe Live Hosts
-        run: |
-          httpx -l subdomains.txt -silent -threads 300 -timeout 10 -o alive.txt
-          echo "ALIVE=$(wc -l < alive.txt || echo 0)" >> $GITHUB_ENV
+          # إضافة مصادر قوية جدًا
+          curl -s "https://chaos.projectdiscovery.io/${{ env.DOMAIN }}" | jq -r '.[].subdomain]' >> chaos.txt || true
+          curl -s "https://crt.sh/?q=%25.${{ env.DOMAIN }}&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' | sort -u >> crtsh.txt || true
 
-      # ────── 6. Nuclei سكان شامل ──────
-      - name: Nuclei Scan
+          cat subfinder.txt chaos.txt crtsh.txt 2>/dev/null | sort -u -o all_subs.txt
+          echo "Total raw subdomains: $(wc -l < all_subs.txt)"
+
+      - name: Probe Live + Title + Tech + Status
         run: |
-          nuclei -l alive.txt -severity critical,high,medium,low -concurrency 70 -c 150 -silent -jsonl -o nuclei.jsonl
-          cat nuclei.jsonl | jq -r '[.info.severity | ascii_upcase] .template-id + " → " + .matched-at' > nuclei.txt 2>/dev/null || true
+          httpx -l all_subs.txt -silent -title -tech-detect -status-code -threads 300 -timeout 15 -o alive.txt
+          echo "ALIVE=$(wc -l < alive.txt)" >> $GITHUB_ENV
+
+      - name: Fast Port Scan (Top 1000 + web ports)
+        run: |
+          cat alive.txt | cut -d' ' -f1 | naabu -top-ports 1000 -exclude-ports 80,443 -silent -o ports.txt
+          cat alive.txt ports.txt | sort -u -o final_targets.txt
+          echo "FINAL_TARGETS=$(wc -l < final_targets.txt)" >> $GITHUB_ENV
+
+      - name: Update Nuclei Templates + Aggressive Scan
+        run: |
+          nuclei -update-templates -silent
+          nuclei -l final_targets.txt -severity critical,high,medium -es info -concurrency 100 -bulk-size 50 -rate-limit 150 -retries 3 -jsonl -o nuclei.jsonl -silent
+          cat nuclei.jsonl | jq -r '[.info.severity] .template-id + " → " + .host + " [" + (.info.name // "No name") + "]"' > nuclei.txt 2>/dev/null || true
           echo "VULNS=$(wc -l < nuclei.txt || echo 0)" >> $GITHUB_ENV
 
-      # ────── 7. تقرير الملخص على ديسكورد ──────
-      - name: Discord → Summary Report
+      # ────── نفس الإشعارات القديمة اللي بتحبها بس محسنة شوية ──────
+      - name: Notify Subdomains Summary
         run: |
-          CRITICAL=$(grep -ic "CRITICAL" nuclei.txt || echo 0)
-          HIGH=$(grep -ic "HIGH" nuclei.txt || echo 0)
-          MEDIUM=$(grep -ic "MEDIUM" nuclei.txt || echo 0)
-          LOW=$(grep -ic "LOW" nuclei.txt || echo 0)
+          ALIVE_COUNT=$(wc -l < alive.txt || echo 0)
+          MESSAGE="**Subfinder + Chaos + crt.sh Complete**\n**Domain:** ${{ env.DOMAIN }}\n**Total Found:** $(wc -l < all_subs.txt)\n**Live Hosts:** $ALIVE_COUNT\n\`\`\`\n$(head -20 alive.txt)\n\`\`\`"
+          [ $(wc -l < all_subs.txt) -gt 20 ] && MESSAGE="${MESSAGE}\n... والباقي في الآرتيفاكتس"
+          curl -s -X POST "${{ env.DISCORD_WEBHOOK }}" -d "{\"content\": $(echo "$MESSAGE" | jq -R .)}"
 
-          if [ $CRITICAL -gt 0 ]; then COLOR=15158332
-          elif [ $HIGH -gt 0 ]; then COLOR=15105570
-          elif [ $MEDIUM -gt 0 ]; then COLOR=16763904
-          else COLOR=3066993; fi
+      - name: Notify Vulnerabilities Summary
+        run: |
+          if [ ${{ env.VULNS }} -eq 0 ]; then
+            curl -s -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**Nuclei Complete**\n**Domain:** `${{ env.DOMAIN }}`\nلا توجد ثغرات Critical/High/Medium"}'
+          else
+            curl -s -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**تم اكتشاف ${{ env.VULNS }} ثغرة خطيرة!**\n**Domain:** `${{ env.DOMAIN }}`\nجاري إرسال التفاصيل..."}'
+          fi
 
-          curl -X POST -H "Content-Type: application/json" "${{ secrets.DISCORD_WEBHOOK }}" -d @- << EOF
-          {
-            "embeds": [{
-              "title": "انتهى السكان بنجاح",
-              "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}",
-              "description": "**الدومين:** \`${{ env.TARGET }}\`\n**السابدومينز الكلية:** ${{ env.SUBDOMAINS }}\n**الحية:** ${{ env.ALIVE }}\n**الثغرات:** ${{ env.VULNS }}",
-              "color": $COLOR,
-              "fields": [
-                {"name": "Critical", "value": "$CRITICAL", "inline": true},
-                {"name": "High", "value": "$HIGH", "inline": true},
-                {"name": "Medium", "value": "$MEDIUM", "inline": true},
-                {"name": "Low", "value": "$LOW", "inline": true}
-              ],
-              "footer": {"text": "اضغط على العنوان لرؤية الـ Run كامل"},
-              "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-            }]
-          }
-          EOF
-
-      # ────── 8. إرسال كل ثغرة في إمبد منفصل (جامد جدًا) ──────
-      - name: Discord → Individual Vulnerabilities
+      - name: Send Each Vulnerability Separately
         if: env.VULNS > 0
         run: |
-          cat nuclei.jsonl | jq -r '
-            . as $raw |
-            ($raw.info.severity | ascii_upcase) as $sev |
-            (if $sev == "CRITICAL" then 15158332
-             elif $sev == "HIGH" then 15105570
-             elif $sev == "MEDIUM" then 16763904
-             elif $sev == "LOW" then 3447003
-             else 10181046 end) as $color |
-            {
-              embeds: [{
-                title: $raw.template-id,
-                description: "**Severity:** `" + $sev + "`\n**Host:** `" + $raw.matched-at + "`\n**Name:** " + $raw.info.name,
-                color: $color,
-                fields: [
-                  { name: "Extracted", value: ($raw.extracted-results // ["-"] |.[0] // "-"), inline: false },
-                  { name: "Matcher", value: ($raw.matcher-name // "N/A"), inline: true }
-                ],
-                footer: { text: "Nuclei • " + ($raw.info.author // "ProjectDiscovery") },
-                timestamp: $raw.timestamp
-              }]
-            } | @json
-          ' | while read payload; do
-            curl -X POST -H "Content-Type: application/json" "${{ secrets.DISCORD_WEBHOOK }}" -d "$payload"
-            sleep 1.5
-          done
+          while IFS= read -r line; do
+            curl -s -X POST "${{ env.DISCORD_WEBHOOK }}" -d "{\"content\": \"**Vulnerability**\n\`\`\`\n$line\n\`\`\`\"}"
+            sleep 1
+          done < nuclei.txt
 
-      # ────── 9. رفع النتايج ──────
-      - name: Upload Artifacts
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: "scan-${{ env.TARGET }}-${{ github.run_id }}"
+          name: scan-results-${{ env.DOMAIN }}
           path: |
-            subdomains.txt
+            all_subs.txt
             alive.txt
-            nuclei.txt
             nuclei.jsonl
-          retention-days: 14
+            nuclei.txt
