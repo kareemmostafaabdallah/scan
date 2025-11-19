@@ -1,4 +1,4 @@
-name: Advanced Subdomain
+name: Subdomain & Vulnerability Scanner
 on:
   workflow_dispatch:
     inputs:
@@ -21,7 +21,7 @@ jobs:
         with:
           go-version: '1.23'
 
-      - name: Install Tools (شغالة 100% مفيهاش أي مشكلة)
+      - name: Install Tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y jq > /dev/null
@@ -33,7 +33,7 @@ jobs:
       - name: Validate Discord Webhook
         run: |
           if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
-            echo "DISCORD_WEBHOOK secret is missing!"
+            echo "DISCORD_WEBHOOK secret missing!"
             exit 1
           fi
           echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
@@ -46,64 +46,79 @@ jobs:
             echo "DOMAIN=example.com" >> $GITHUB_ENV
           fi
 
+      # 1. إشعار البداية
       - name: Notify Start
         run: |
           curl -X POST -H "Content-Type: application/json" "${{ env.DISCORD_WEBHOOK }}" -d '{
             "content": "**بدء السكان**\n**Domain:** `'${{ env.DOMAIN }}'`\n**Trigger:** ${{ github.event_name }}\n**Time:** <t:$(date +%s):F>"
           }'
 
-      # ============ الفحص الجامد جدًا (2025) ============
+      # 2. فحص السابدومينز الجامد (Subfinder + Chaos + crt.sh)
       - name: Ultimate Subdomain Enumeration
         run: |
-          # Subfinder + كل المصادر
           subfinder -d ${{ env.DOMAIN }} -all -silent -o subfinder.txt
 
-          # Chaos (مجاني وسريع جدًا)
           curl -s "https://chaos.projectdiscovery.io/?q=${{ env.DOMAIN }}" | jq -r '.[].subdomain' 2>/dev/null >> chaos.txt || true
-
-          # crt.sh
           curl -s "https://crt.sh/?q=%.${{ env.DOMAIN }}&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' | tr '[:upper:]' '[:lower:]' >> crtsh.txt || true
 
-          # جمع الكل + إزالة الدوبلكيت
           cat subfinder.txt chaos.txt crtsh.txt 2>/dev/null | sort -u -o all_subdomains.txt
           echo "SUBDOMAINS=$(wc -l < all_subdomains.txt)" >> $GITHUB_ENV
 
-      - name: Probe Live Hosts (Title + Status + Tech)
+      # 3. فحص الحية + عنوان + تقنيات
+      - name: Probe Live Hosts
         run: |
-          httpx -l all_subdomains.txt -silent -title -status-code -tech-detect -threads 400 -timeout 10 -o alive.txt
+          httpx -l all_subdomains.txt -silent -title -status-code -tech-detect -threads 400 -timeout 12 -o alive.txt
           echo "ALIVE=$(wc -l < alive.txt || echo 0)" >> $GITHUB_ENV
 
-      - name: Update & Run Nuclei (أقوى وأسرع)
+      # 4. Nuclei بدون أي تحذير
+      - name: Update & Run Nuclei
         run: |
           nuclei -update-templates -silent
-          nuclei -l alive.txt -severity critical,high,medium -es info -concurrency 100 -rate-limit 200 -retries 2 -jsonl -o nuclei.jsonl -silent
-          cat nuclei.jsonl | jq -r '[.info.severity | ascii_upcase] .template-id + " → " + .matched-at + " [" + (.info.name // "No name") + "]"' > nuclei.txt 2>/dev/null || echo "No vulnerabilities" > nuclei.txt
-          echo "VULNS=$(wc -l < nuclei.txt)" >> $GITHUB_ENV
+          nuclei -l alive.txt -severity critical,high,medium -es info -auto -rate-limit 200 -retries 2 -jsonl -o nuclei.jsonl -silent
+          cat nuclei.jsonl | jq -r '[.info.severity | ascii_upcase] .template-id + " → " + .matched-at + " [" + (.info.name // "No name") + "]"' > nuclei.txt 2>/dev/null || echo "" > nuclei.txt
+          echo "VULNS=$(wc -l < nuclei.txt || echo 0)" >> $GITHUB_ENV
 
-      # ============ إشعارات ديسكورد زي ما تحبها ============
+      # 5. إشعار السابدومينز الحية
       - name: Notify Subdomains Results
         run: |
-          SAMPLE=$(head -15 alive.txt | cut -d' ' -f1 | sed 's/^/• /')
-          MESSAGE="**تم العثور على سابدومينز**\n**Domain:** ${{ env.DOMAIN }}\n**الكل:** ${{ env.SUBDOMAINS }}\n**الحية:** ${{ env.ALIVE }}\n\`\`\`\n$SAMPLE\n\`\`\`"
-          [ ${{ env.ALIVE }} -gt 15 ] && MESSAGE="$MESSAGE\n... والباقي في الآرتيفاكتس"
+          SAMPLE=$(head -30 alive.txt | cut -d' ' -f1 | sed 's/^/• /')
+          MESSAGE="**تم العثور على سابدومينز حية**\n**Domain:** ${{ env.DOMAIN }}\n**الكل:** ${{ env.SUBDOMAINS }} | **الحية:** ${{ env.ALIVE }}\n\`\`\`\n$SAMPLE"
+          if [ ${{ env.ALIVE }} -gt 30 ]; then
+            MESSAGE="$MESSAGE\n... و $((${env.ALIVE}-30)) تانيين في الآرتيفاكتس"
+          fi
+          MESSAGE="$MESSAGE\n\`\`\`"
           curl -X POST -H "Content-Type: application/json" "${{ env.DISCORD_WEBHOOK }}" -d "{\"content\": \"$MESSAGE\"}"
 
+      # 6. ملخص الثغرات
       - name: Notify Nuclei Summary
         run: |
           if [ ${{ env.VULNS }} -eq 0 ]; then
-            curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**Nuclei Complete**\n**Domain:** `'${{ env.DOMAIN }}'`\nلا توجد ثغرات خطيرة"}'
+            curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{
+              "content": "**Nuclei Complete**\n**Domain:** `'${{ env.DOMAIN }}'`\nلا توجد ثغرات Critical/High/Medium"
+            }'
           else
-            curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**تم اكتشاف ${{ env.VULNS }} ثغرة خطيرة!**\n**Domain:** `'${{ env.DOMAIN }}'`\nجاري إرسال التفاصيل..."}'
+            curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{
+              "content": "**تم اكتشاف ${{ env.VULNS }} ثغرة خطيرة!**\n**Domain:** `'${{ env.DOMAIN }}'`\nجاري إرسال التفاصيل..."
+            }'
           fi
 
+      # 7. كل ثغرة في رسالة منفصلة
       - name: Send Each Vulnerability
         if: env.VULNS > 0
         run: |
           while IFS= read -r vuln; do
-            curl -X POST -H "Content-Type: application/json" "${{ env.DISCORD_WEBHOOK }}" -d "{\"content\": \"**ثغرة جديدة**\n\`\`\`\n$vuln\n\`\`\`\"}"
-            sleep 1
+            curl -X POST -H "Content-Type: application/json" "${{ env.DISCORD_WEBHOOK }}" -d "{\"content\": \"**ثغرة مكتشفة**\n\`\`\`\n$vuln\n\`\`\`\"}"
+            sleep 1.2
           done < nuclei.txt
 
+      # 8. رسالة النهاية + رابط الـ Run
+      - name: Final Summary
+        run: |
+          curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{
+            "content": "**السكان انتهى تمامًا**\n**Domain:** `'${{ env.DOMAIN }}'`\n**Live Hosts:** ${{ env.ALIVE }}\n**Vulnerabilities:** ${{ env.VULNS }}\nرابط الـ Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }'
+
+      # 9. رفع النتايج
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
