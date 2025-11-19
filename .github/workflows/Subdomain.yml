@@ -1,0 +1,92 @@
+name: Subdomain
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Domain to scan'
+        required: true
+        default: 'example.com'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.23'
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y jq > /dev/null
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+
+      - name: Check Discord Webhook
+        run: |
+          [ -z "${{ secrets.DISCORD_WEBHOOK }}" ] && echo "Add DISCORD_WEBHOOK secret!" && exit 1
+          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}" >> $GITHUB_ENV
+
+      - name: Set Domain
+        run: echo "DOMAIN=${{ inputs.domain }}" >> $GITHUB_ENV
+
+      - name: Notify Start
+        run: curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**بدء السكان**\n**Domain:** `'${{ env.DOMAIN }}'`\n**Time:** <t:$(date +%s):F>"}'
+
+      - name: Subdomain Enumeration
+        run: |
+          subfinder -d ${{ env.DOMAIN }} -all -silent -o subfinder.txt
+          curl -s "https://chaos.projectdiscovery.io/?q=${{ env.DOMAIN }}" | jq -r '.[].subdomain' 2>/dev/null >> chaos.txt || true
+          curl -s "https://crt.sh/?q=%.${{ env.DOMAIN }}&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' >> crtsh.txt || true
+          cat subfinder.txt chaos.txt crtsh.txt 2>/dev/null | sort -u -o all.txt
+          echo "SUBS=$(wc -l < all.txt)" >> $GITHUB_ENV
+
+      - name: Probe Live Hosts
+        run: |
+          httpx -l all.txt -silent -title -status-code -threads 300 -timeout 10 -o alive.txt
+          echo "ALIVE=$(wc -l < alive.txt || echo 0)" >> $GITHUB_ENV
+
+      - name: Nuclei Scan
+        run: |
+          nuclei -update-templates -silent
+          nuclei -l alive.txt -severity critical,high,medium -es info -c 50 -rl 150 -retries 2 -jsonl -o nuclei.jsonl -silent
+          cat nuclei.jsonl | jq -r '[.info.severity | ascii_upcase] .template-id + " → " + .matched-at + " [" + (.info.name // "N/A") + "]"' > nuclei.txt 2>/dev/null || true
+          echo "VULNS=$(wc -l < nuclei.txt || echo 0)" >> $GITHUB_ENV
+
+      - name: Notify Subdomains
+        run: |
+          SAMPLE=$(head -25 alive.txt | cut -d' ' -f1 | sed 's/^/• /' | tr '\n' '\n')
+          curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d "{\"content\": \"**Subdomains الحية**\n**Domain:** ${{ env.DOMAIN }}\n**Total:** ${{ env.SUBS }} | **Live:** ${{ env.ALIVE }}\n\`\`\`\n$SAMPLE\n\`\`\`\"}"
+
+      - name: Notify Vulnerabilities Summary
+        run: |
+          if [ ${{ env.VULNS }} -eq 0 ]; then
+            curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**Nuclei Complete**\n**Domain:** `'${{ env.DOMAIN }}'`\nلا توجد ثغرات خطيرة"}'
+          else
+            curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**تم اكتشاف ${{ env.VULNS }} ثغرة خطيرة!**\nجاري إرسال التفاصيل..."}'
+          fi
+
+      - name: Send Each Vulnerability
+        if: env.VULNS > 0
+        run: |
+          while IFS= read -r v; do
+            curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d "{\"content\": \"**ثغرة مكتشفة**\n\`\`\`\n$v\n\`\`\`\"}"
+            sleep 1
+          done < nuclei.txt
+
+      - name: Final Message
+        run: curl -X POST "${{ env.DISCORD_WEBHOOK }}" -d '{"content": "**السكان انتهى**\n**Domain:** `'${{ env.DOMAIN }}'`\n**Live:** ${{ env.ALIVE }} | **Vulns:** ${{ env.VULNS }}\nرابط: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-${{ env.DOMAIN }}
+          path: |
+            all.txt
+            alive.txt
+            nuclei.txt
+            nuclei.jsonl
