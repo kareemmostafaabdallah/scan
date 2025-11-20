@@ -1,10 +1,10 @@
-name: Advanced Subdomain.
+name: Advanced Subdomain
 
 on:
   workflow_dispatch:
     inputs:
       domain:
-        description: 'Target domain'
+        description: 'Target domain (e.g. wien.gv.at)'
         required: true
         default: 'example.com'
 
@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 360
     
     env:
-      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}   # ← الحل السحري
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}  # الحل السحري لمشكلة الـ ***
 
     steps:
       - name: Checkout
@@ -23,30 +23,37 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '>=1.23.0'
+          go-version: '>=1.23'
           cache: true
 
-      - name: Install Tools
+      - name: Install Tools (Stable Versions Only)
         run: |
-          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          go install -v github.com/tomnomnom/assetfinder@latest
+          # أدوات شغالة 100% بدون أي panic أو pcap error
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/tomnomnom/assetfinder@latest
           
+          # httpx إصدار ثابت بدون الباج الجديد (v1.6.9 = ذهب)
+          go install github.com/projectdiscovery/httpx/cmd/httpx@v1.6.9
+          
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+
+          # PATH
           echo "$HOME/go/bin" >> $GITHUB_PATH
-          
+
+          # Findomain
           curl -sLO https://github.com/Findomain/Findomain/releases/latest/download/findomain-linux.zip
           unzip -o findomain-linux.zip && chmod +x findomain && sudo mv findomain /usr/local/bin/
+
+          # jq
           sudo apt-get update -qq && sudo apt-get install -y jq
 
-      # ← الـ validation دلوقتي شغال 100% لأن الـ env معبي
       - name: Validate Discord Webhook
         run: |
           if [ -z "$DISCORD_WEBHOOK" ] || [ "$DISCORD_WEBHOOK" = "***" ]; then
-            echo "DISCORD_WEBHOOK is missing or hidden!"
+            echo "::error::DISCORD_WEBHOOK secret is missing or not loaded!"
             exit 1
           else
-            echo "Discord webhook is ready!"
+            echo "Discord webhook loaded successfully"
           fi
 
       - name: Set Target
@@ -56,76 +63,135 @@ jobs:
       - name: Notify Start
         run: |
           curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
-            "embeds": [{"title": "Scan Started", "description": "**Target:** `'${{ inputs.domain }}'`", "color": 16745728}]
+            "embeds": [{
+              "title": "Scan Started",
+              "description": "**Target:** `${{ inputs.domain }}`\n**Mode:** Maximum Accuracy\n**Runner:** GitHub Actions",
+              "color": 16745728,
+              "timestamp": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
+            }]
           }'
 
-      # باقي الـ workflow زي ما هو (recon → httpx → nuclei → send results)
-      # أحط الباقي كله هنا عشان تبقى نسخة كاملة وتشتغل من أول مرة
-
-      - name: Ultimate Recon
+      - name: Ultimate Subdomain Enumeration
         run: |
+          echo "[+] Starting massive subdomain enumeration..."
+          
           subfinder -d ${{ inputs.domain }} -all -recursive -silent -o s1.txt
           assetfinder --subs-only ${{ inputs.domain }} > s2.txt
           findomain -t ${{ inputs.domain }} -q > s3.txt
-          curl -s "https://crt.sh/?q=%25.${{ inputs.domain }}&output=json" | jq -r '.[].name_value' | sort -u > s4.txt
+          curl -s "https://crt.sh/?q=%25.${{ inputs.domain }}&output=json" | jq -r '.[].name_value' 2>/dev/null | sort -u > s4.txt
           
-          cat s*.txt | sort -u | grep -v '*' > all-subdomains.txt
-          echo "TOTAL=$(wc -l < all-subdomains.txt)" >> $GITHUB_ENV
+          cat s*.txt 2>/dev/null | sort -u | grep -v '*' > all-subdomains.txt
+          echo "TOTAL_RAW=$(wc -l < all-subdomains.txt)" >> $GITHUB_ENV
 
-      - name: Probe Alive
+      - name: Probe Alive Hosts (100% Stable httpx v1.6.9)
         run: |
-          httpx -l all-subdomains.txt -silent -threads 500 -timeout 20 -follow-redirects -o alive.txt
-          echo "ALIVE=$(wc -l < alive.txt || echo 0)" >> $GITHUB_ENV
+          echo "[+] Probing with stable httpx v1.6.9 (no panic)..."
+          
+          httpx -l all-subdomains.txt \
+            -silent \
+            -threads 500 \
+            -timeout 20 \
+            -follow-redirects \
+            -title \
+            -status-code \
+            -tech-detect \
+            -o alive.txt || true
+
+          echo "ALIVE_COUNT=$(wc -l < alive.txt || echo 0)" >> $GITHUB_ENV
+
+      - name: Recon Summary
+        run: |
+          curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
+            "embeds": [{
+              "title": "Recon Complete",
+              "fields": [
+                {"name": "Target", "value": "${{ inputs.domain }}", "inline": true},
+                {"name": "Total Found", "value": "${{ env.TOTAL_RAW }}", "inline": true},
+                {"name": "Alive", "value": "${{ env.ALIVE_COUNT }}", "inline": true}
+              ],
+              "color": 3066993
+            }]
+          }'
 
       - name: Update Nuclei Templates
         run: nuclei -update-templates -silent
 
-      - name: Run Nuclei
+      - name: Run Nuclei (Stable & Deep Scan)
         run: |
-          nuclei -l alive.txt -severity critical,high,medium,low,info \
-            -c 40 -bulk-size 20 -rate-limit 80 -retries 5 -timeout 20 \
-            -jsonl -o nuclei.jsonl -silent || true
+          echo "[+] Running deep Nuclei scan..."
           
+          nuclei -l alive.txt \
+            -severity critical,high,medium,low,info \
+            -c 40 \
+            -bulk-size 20 \
+            -rate-limit 80 \
+            -retries 5 \
+            -timeout 20 \
+            -jsonl \
+            -o nuclei.jsonl \
+            -silent || true
+
           [ ! -f nuclei.jsonl ] && touch nuclei.jsonl
-          echo "VULNS=$(wc -l < nuclei.jsonl)" >> $GITHUB_ENV
+          VULN_COUNT=$(wc -l < nuclei.jsonl || echo 0)
+          echo "VULN_COUNT=$VULN_COUNT" >> $GITHUB_ENV
 
-      - name: Send Results
+      - name: Send Vulnerabilities (Beautiful Embeds)
+        if: env.VULN_COUNT > 0
         run: |
-          if [ ${{ env.VULNS }} -gt 0 ]; then
-            jq -c . nuclei.jsonl | while read v; do
-              sev=$(echo "$v" | jq -r '.info.severity // "info"')
-              name=$(echo "$v" | jq -r '.info.name')
-              url=$(echo "$v" | jq -r '."matched-at" // .host')
-              color=10181046
-              [[ $sev == "critical" ]] && color=15158332
-              [[ $sev == "high" ]] && color=15105570
-              [[ $sev == "medium" ]] && color=16763904
+          echo "[+] Sending $VULN_COUNT vulnerabilities to Discord..."
+          jq -c . nuclei.jsonl | while read v; do
+            sev=$(echo "$v" | jq -r '.info.severity // "info"')
+            name=$(echo "$v" | jq -r '.info.name // "Unknown"')
+            url=$(echo "$v" | jq -r '."matched-at" // .host')
+            
+            case $sev in
+              critical) color=15158332 ;;
+              high)     color=15105570 ;;
+              medium)   color=16763904 ;;
+              low)      color=4437377  ;;
+              *)        color=10181046 ;;
+            esac
 
-              curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d "{
-                \"embeds\": [{
-                  \"title\": \"$name\",
-                  \"description\": \"\`$url\`\",
-                  \"color\": $color,
-                  \"fields\": [{\"name\": \"Severity\", \"value\": \"${sev^}\"}]
-                }]
-              }"
-              sleep 1.2
-            done
-          else
-            curl -X POST "$DISCORD_WEBHOOK" -d '{"content": "Clean! No vulnerabilities found"}'
-          fi
+            curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d "{
+              \"embeds\": [{
+                \"title\": \"${name:0:250}\",
+                \"url\": \"$url\",
+                \"description\": \"\`\`\`$url\`\`\`\",
+                \"color\": $color,
+                \"fields\": [{\"name\": \"Severity\", \"value\": \"${sev^}\", \"inline\": true}],
+                \"footer\": {\"text\": \"${{ inputs.domain }} • Nuclei\"}
+              }]
+            }"
+            sleep 1.5
+          done
 
-      - name: Upload Artifacts
+      - name: No Vulnerabilities
+        if: env.VULN_COUNT == '0'
+        run: |
+          curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
+            "embeds": [{
+              "title": "Clean Result!",
+              "description": "No vulnerabilities found after deep scan.",
+              "color": 5763719
+            }]
+          }'
+
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.domain }}-$(date +%Y%m%d-%H%M%S)
+          name: ${{ inputs.domain }}-scan-$(date +%Y%m%d-%H%M%S)
           path: |
             all-subdomains.txt
             alive.txt
             nuclei.jsonl
 
-      - name: Final Notify
+      - name: Final Notification
         run: |
-          curl -X POST "$DISCORD_WEBHOOK" -d '{
-            "embeds": [{"title": "Scan Finished", "description": "**Target:** ${{ inputs.domain }}\n**Vulns:** ${{ env.VULNS }}\nCheck artifacts!", "color": 5793266}]
+          curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
+            "embeds": [{
+              "title": "Scan Completed Successfully",
+              "description": "**Target:** ${{ inputs.domain }}\n**Alive Hosts:** ${{ env.ALIVE_COUNT }}\n**Vulnerabilities:** ${{ env.VULN_COUNT }}\nResults in artifacts",
+              "color": 5793266,
+              "timestamp": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"
+            }]
           }'
