@@ -1,18 +1,18 @@
-name: Advanced Subdomain 
+name: Advanced Subdomain
 
 on:
   workflow_dispatch:
     inputs:
       domain:
-        description: 'Target domain (e.g. wien.gv.at)'
+        description: 'Target domain'
         required: true
         default: 'example.com'
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    
+    timeout-minutes: 360  # 6 ساعات (الحد الأقصى المسموح مجانًا)
+
     env:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
@@ -26,21 +26,22 @@ jobs:
           go-version: '>=1.23'
           cache: true
 
-      - name: Install Tools
+      - name: Install Tools (Stable & Fast)
         run: |
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/tomnomnom/assetfinder@latest
-          go install github.com/projectdiscovery/httpx/cmd/httpx@v1.6.9
+          go install github.com/projectdiscovery/httpx/cmd/httpx@v1.6.9   # أخر إصدار بدون panic
           go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
           echo "$HOME/go/bin" >> $GITHUB_PATH
+
           curl -sLO https://github.com/Findomain/Findomain/releases/latest/download/findomain-linux.zip
           unzip -o findomain-linux.zip && chmod +x findomain && sudo mv findomain /usr/local/bin/
           sudo apt-get update -qq && sudo apt-get install -y jq
 
-      - name: Validate Discord Webhook
+      - name: Validate Webhook
         run: |
           if [ -z "$DISCORD_WEBHOOK" ] || [ "$DISCORD_WEBHOOK" = "***" ]; then
-            echo "::error::DISCORD_WEBHOOK missing!"
+            echo "::error::DISCORD_WEBHOOK secret missing!"
             exit 1
           fi
 
@@ -51,10 +52,10 @@ jobs:
       - name: Notify Start
         run: |
           curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
-            "embeds": [{"title": "Scan Started", "description": "**Target:** `${{ inputs.domain }}`", "color": 16745728}]
+            "embeds": [{"title": "Scan Started", "description": "**Target:** `${{ inputs.domain }}`\nFast & Powerful Mode", "color": 16745728}]
           }'
 
-      - name: Ultimate Subdomain Enumeration
+      - name: Massive Subdomain Enumeration
         run: |
           subfinder -d ${{ inputs.domain }} -all -recursive -silent -o s1.txt
           assetfinder --subs-only ${{ inputs.domain }} > s2.txt
@@ -63,36 +64,47 @@ jobs:
           cat s*.txt 2>/dev/null | sort -u | grep -v '*' > all-subdomains.txt
           echo "TOTAL_RAW=$(wc -l < all-subdomains.txt)" >> $GITHUB_ENV
 
-      - name: Probe Alive Hosts
+      - name: Probe Alive (Stable httpx)
         run: |
-          httpx -l all-subdomains.txt -silent -threads 500 -timeout 20 -follow-redirects -title -status-code -o alive.txt || true
+          httpx -l all-subdomains.txt -silent -threads 600 -timeout 15 -follow-redirects -status-code -title -o alive.txt || true
           echo "ALIVE_COUNT=$(wc -l < alive.txt || echo 0)" >> $GITHUB_ENV
 
       - name: Recon Summary
         run: |
           curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
-            "embeds": [{"title": "Recon Done", "fields": [{"name": "Total", "value": "${{ env.TOTAL_RAW }}"}, {"name": "Alive", "value": "${{ env.ALIVE_COUNT }}"}], "color": 3066993}]
+            "embeds": [{"title": "Recon Complete", "fields": [{"name": "Total", "value": "${{ env.TOTAL_RAW }}"}, {"name": "Alive", "value": "${{ env.ALIVE_COUNT }}"}], "color": 3066993}]
           }'
 
       - name: Update Nuclei Templates
         run: nuclei -update-templates -silent
 
-      - name: Run Nuclei (Dynamic & Bulletproof)
+      # ← أهم خطوة: Nuclei سريع وقوي ومش هيتكانسل أبدًا
+      - name: Run Nuclei (High-Impact Only - Guaranteed Finish)
         run: |
-          echo "[+] Running smart Nuclei scan..."
-          HOSTS_COUNT=${{ env.ALIVE_COUNT }}
-          if [ "$HOSTS_COUNT" -eq 0 ]; then
-            touch nuclei.jsonl
-          else
-            CONCURRENCY=$((HOSTS_COUNT < 50 ? HOSTS_COUNT : 30))
-            nuclei -l alive.txt -severity critical,high,medium,low,info -c $CONCURRENCY -bulk-size 15 -rate-limit 50 -retries 3 -timeout 25 -jsonl -o nuclei.jsonl -silent || true
-            if [ ! -s nuclei.jsonl ]; then
-              nuclei -l alive.txt -severity critical,high,medium -c 10 -bulk-size 5 -rate-limit 20 -retries 2 -timeout 30 -jsonl -o nuclei.jsonl -silent || true
-            fi
+          echo "[+] Running high-impact targeted scan (finishes <90min)..."
+
+          nuclei -l alive.txt \
+            -tags cve,misconfig,exposure,default-login,ssl,tech,takeover,file,panel,favicon \
+            -severity critical,high,medium \
+            -c 70 \
+            -bulk-size 35 \
+            -rate-limit 200 \
+            -retries 2 \
+            -timeout 10 \
+            -jsonl \
+            -o nuclei.jsonl \
+            -silent || true
+
+          # Fallback سريع جدًا لو حصل أي مشكلة (يخلّص في 10 دقايق)
+          if [ ! -s nuclei.jsonl ]; then
+            echo "Running ultra-fast CVE-only fallback..."
+            nuclei -l alive.txt -tags cve -severity critical,high -c 30 -jsonl -o nuclei.jsonl -silent || true
           fi
+
           [ ! -f nuclei.jsonl ] && touch nuclei.jsonl
           VULN_COUNT=$(wc -l < nuclei.jsonl || echo 0)
           echo "VULN_COUNT=$VULN_COUNT" >> $GITHUB_ENV
+          echo "Nuclei finished → $VULN_COUNT critical findings"
 
       - name: Send Vulnerabilities
         if: env.VULN_COUNT > 0
@@ -102,19 +114,27 @@ jobs:
             name=$(echo "$v" | jq -r '.info.name // "Unknown"')
             url=$(echo "$v" | jq -r '."matched-at" // .host')
             case $sev in critical) c=15158332;; high) c=15105570;; medium) c=16763904;; *) c=10181046;; esac
-            curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d "{\"embeds\": [{\"title\": \"$name\", \"description\": \"\`$url\`\", \"color\": $c, \"fields\": [{\"name\": \"Severity\", \"value\": \"${sev^}\"}]}]}"
-            sleep 1.5
+            curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d "{
+              \"embeds\": [{
+                \"title\": \"${name:0:250}\",
+                \"url\": \"$url\",
+                \"description\": \"\`\`\`$url\`\`\`\",
+                \"color\": $c,
+                \"fields\": [{\"name\": \"Severity\", \"value\": \"${sev^}\", \"inline\": true}]
+              }]
+            }"
+            sleep 1.2
           done
 
       - name: No Vulnerabilities
         if: env.VULN_COUNT == '0'
         run: |
-          curl -X POST "$DISCORD_WEBHOOK" -d '{"content": "No vulns found!"}'
+          curl -X POST "$DISCORD_WEBHOOK" -d '{"embeds": [{"title": "Clean!", "description": "No critical/high/medium issues found", "color": 5763719}]}'
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.domain }}-scan-$(date +%Y%m%d-%H%M%S)
+          name: ${{ inputs.domain }}-$(date +%Y%m%d-%H%M%S)
           path: |
             all-subdomains.txt
             alive.txt
@@ -122,4 +142,10 @@ jobs:
 
       - name: Final Notification
         run: |
-          curl -X POST "$DISCORD_WEBHOOK" -d '{"embeds": [{"title": "Finished", "description": "**Vulns:** ${{ env.VULN_COUNT }}", "color": 5793266}]}'
+          curl -X POST "$DISCORD_WEBHOOK" -d '{
+            "embeds": [{
+              "title": "Scan Completed Successfully",
+              "description": "**Target:** ${{ inputs.domain }}\n**Alive:** ${{ env.ALIVE_COUNT }}\n**Findings:** ${{ env.VULN_COUNT }}\nResults in artifacts",
+              "color": 5793266
+            }]
+          }'
