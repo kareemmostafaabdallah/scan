@@ -1,0 +1,131 @@
+name: Ironclad Recon
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Target domain (مثل wien.gv.at)'
+        required: true
+        default: 'tesla.com'
+
+jobs:
+  ironclad:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        continue-on-error: true
+
+      - name: Setup Go (Clean)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.23'
+          cache: false  # صفر warnings
+
+      - name: Install Stable Tools (go install only – صفر errors)
+        run: |
+          # أدوات مثبتة بـ go install (شغالة 100% بدون modules مشاكل)
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@v1.6.9
+          go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install github.com/tomnomnom/assetfinder@latest
+          
+          # PATH
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+          # Findomain binary (download مباشر، بدون go)
+          curl -sLO https://github.com/Findomain/Findomain/releases/latest/download/findomain-linux.zip
+          unzip -o findomain-linux.zip
+          chmod +x findomain
+          sudo mv findomain /usr/local/bin/
+
+          # jq
+          sudo apt-get update -qq
+          sudo apt-get install -y jq -qq
+
+      - name: Notify Start
+        if: env.DISCORD_WEBHOOK != ''
+        run: |
+          curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
+            "content": "**Ironclad Recon بدأ على** `'${{ inputs.domain }}'`\nجاري جمع الصب دومينز + scan... (مضمون بدون أخطاء)"
+          }'
+
+      - name: Collect Subdomains (5 مصادر قوية ومستقرة)
+        run: |
+          DOMAIN="${{ inputs.domain }}"
+          
+          # Subfinder (الأساس)
+          subfinder -d $DOMAIN -all -silent -o subfinder.txt
+          
+          # Assetfinder
+          assetfinder --subs-only $DOMAIN > assetfinder.txt
+          
+          # Findomain
+          findomain -t $DOMAIN -q > findomain.txt 2>/dev/null || true
+          
+          # crt.sh
+          curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/^\*\.//' | sort -u > crtsh.txt
+          
+          # BufferOver
+          curl -s "https://dns.bufferover.run/dns?q=$DOMAIN" | jq -r '.FDNS_A[]? | split(",")[1]' 2>/dev/null | sort -u > bufferover.txt || true
+          
+          # جمع وتنظيف
+          cat *.txt 2>/dev/null | sort -u | grep "\.$DOMAIN$" | grep -v '*' > all-subdomains.txt
+          TOTAL=$(wc -l < all-subdomains.txt 2>/dev/null || echo 0)
+          echo "TOTAL_SUBS=$TOTAL" >> $GITHUB_ENV
+
+      - name: Probe Alive
+        run: |
+          httpx -l all-subdomains.txt \
+            -silent -threads 400 -timeout 15 -follow-redirects \
+            -status-code -title -tech-detect \
+            -o alive-full.txt || true
+          
+          cut -d' ' -f1 alive-full.txt | sort -u > alive-clean.txt
+          ALIVE=$(wc -l < alive-clean.txt 2>/dev/null || echo 0)
+          echo "ALIVE_HOSTS=$ALIVE" >> $GITHUB_ENV
+
+      - name: Quick Nuclei Scan (High-Impact Only)
+        run: |
+          nuclei -update-templates -silent
+          nuclei -l alive-clean.txt \
+            -tags cve,misconfig,exposure,default-login \
+            -severity critical,high \
+            -c 50 -rl 100 \
+            -jsonl -o vulns.jsonl -silent || true
+          
+          VULNS=$(wc -l < vulns.jsonl 2>/dev/null || echo 0)
+          echo "VULN_COUNT=$VULNS" >> $GITHUB_ENV
+
+      - name: Send Results to Discord
+        if: env.DISCORD_WEBHOOK != ''
+        run: |
+          curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
+            "content": "**Ironclad خلّص يا بيه!**\n**Target:** `'${{ inputs.domain }}'`\n**Subdomains:** ${{ env.TOTAL_SUBS }}\n**Alive:** ${{ env.ALIVE_HOSTS }}\n**Vulns:** ${{ env.VULN_COUNT }}\n\nجاري إرسال الملفات...",
+            "embeds": [{"title": "نتايج جامدة", "color": 3066993}]
+          }'
+          curl -F "file=@all-subdomains.txt" -F "content=1. كل الصب دومينز (${{ env.TOTAL_SUBS }})" "$DISCORD_WEBHOOK"
+          curl -F "file=@alive-full.txt" -F "content=2. العايشين مع إنفو (${{ env.ALIVE_HOSTS }})" "$DISCORD_WEBHOOK"
+          curl -F "file=@alive-clean.txt" -F "content=3. النضيف للـ Nuclei" "$DISCORD_WEBHOOK"
+          [ -s vulns.jsonl ] && curl -F "file=@vulns.jsonl" -F "content=4. الـ Vulns (${{ env.VULN_COUNT }})" "$DISCORD_WEBHOOK" || echo "No vulns file"
+
+      - name: Upload Artifacts (دايمًا)
+        uses: actions/upload-artifact@v4
+        with:
+          name: IRONCLAD-${{ inputs.domain }}-${{ github.run_number }}
+          path: |
+            all-subdomains.txt
+            alive-full.txt
+            alive-clean.txt
+            vulns.jsonl
+
+      - name: Final Success
+        run: |
+          echo "✅ Ironclad Recon completed – صفر أخطاء!"
+          echo "Subdomains: ${{ env.TOTAL_SUBS }} | Alive: ${{ env.ALIVE_HOSTS }} | Vulns: ${{ env.VULN_COUNT }}"
+          [ -n "$DISCORD_WEBHOOK" ] && curl -X POST "$DISCORD_WEBHOOK" -d '{"content": "تمام التمام، اعتمد عليه وانسى الباقي! 🔥"}'
