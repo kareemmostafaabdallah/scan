@@ -1,0 +1,122 @@
+name: Monster Subdomain 
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Target domain (مثلاً wien.gv.at)'
+        required: true
+        default: 'example.com'
+
+jobs:
+  monster-recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
+
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.23'
+          cache: true
+
+      - name: Install All Monster Tools
+        run: |
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@v1.6.9
+          go install -v github.com/tomnomnom/assetfinder@latest
+          go install -v github.com/OWASP/Amass/v3/amass@latest
+
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+          # Findomain
+          curl -sLO https://github.com/Findomain/Findomain/releases/latest/download/findomain-linux.zip
+          unzip -o findomain-linux.zip && chmod +x findomain && sudo mv findomain /usr/local/bin/
+
+          # puredns + wordlist للـ bruteforce (اختياري)
+          curl -sLO https://github.com/d3ext/massive-subdomain-list/raw/main/best-dns-wordlist.txt
+          curl -sLO https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt
+
+          sudo apt-get update -qq && sudo apt-get install -y jq parallel
+
+      - name: Validate Webhook
+        run: |
+          [ -z "$DISCORD_WEBHOOK" ] && echo "::error::ضيف الـ DISCORD_WEBHOOK في Secrets" && exit 1
+
+      - name: Notify Start
+        run: |
+          curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
+            "embeds": [{"title": "Monster Recon Started", "description": "**Target:** `'${{ inputs.domain }}'`\nجاري جمع كل صب دومين موجود في الكون...", "color": 16711680}]
+          }'
+
+      - name: Monster Enumeration (12+ مصادر)
+        run: |
+          DOMAIN="${{ inputs.domain }}"
+
+          echo "[+] جاري الجمع من 12 مصدر..."
+
+          subfinder -d $DOMAIN -all -recursive -silent -o subfinder.txt
+          assetfinder --subs-only $DOMAIN > assetfinder.txt
+          findomain -t $DOMAIN -q > findomain.txt
+          amass enum -passive -d $DOMAIN -o amass.txt
+          curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' | sort -u > crtsh.txt
+          curl -s "https://dns.bufferover.run/dns?q=$DOMAIN" | jq -r '.FDNS_A[],.FDNS_CNAME[]?' 2>/dev/null | cut -d',' -f2 | sort -u > bufferover.txt
+          curl -s "https://rapiddns.io/subdomain/$DOMAIN?full=1" | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" | sort -u > rapiddns.txt
+          curl -s "https://riddler.io/search/exportcsv?q=pld:$DOMAIN" | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" | sort -u > riddler.txt || true
+          curl -s "https://sonar.omnisint.io/subdomains/$DOMAIN" | jq -r '.[]' > chaos.txt 2>/dev/null || true
+          curl -s "https://www.googleapis.com/customsearch/v1?q=site:$DOMAIN&key=NOPE&cx=NOPE" | jq -r '.items[].link' 2>/dev/null | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" > google.txt || true
+
+          cat *.txt 2>/dev/null | sort -u | grep -v '*' > all-raw.txt
+          echo "TOTAL_RAW=$(wc -l < all-raw.txt)" >> $GITHUB_ENV
+
+      - name: Bruteforce (60k كلمة - اختياري بس جامد)
+        run: |
+          DOMAIN="${{ inputs.domain }}"
+          cat best-dns-wordlist.txt subdomains-top1million-5000.txt | anew wordlist.txt
+          puredns bruteforce wordlist.txt $DOMAIN --resolvers trusted-resolvers.txt -q > brute.txt || true
+          cat brute.txt >> all-raw.txt
+          sort -u all-raw.txt -o all-raw.txt
+
+      - name: Resolve + Clean
+        run: |
+          dnsx -l all-raw.txt -resp-only -silent | sort -u > resolved.txt
+          httpx -l resolved.txt -silent -status-code -title -threads 500 -timeout 15 -o alive.txt || true
+
+          cat alive.txt | cut -d ' ' -f1 | sort -u > final-clean.txt
+          echo "FINAL_COUNT=$(wc -l < final-clean.txt)" >> $GITHUB_ENV
+
+      - name: Send Results to Discord
+        run: |
+          curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
+            "content": "**Monster Recon خلّص يا وحش!**\n**Target:** `'${{ inputs.domain }}'`\n**الخام:** ${{ env.TOTAL_RAW }}\n**العايشين:** ${{ env.FINAL_COUNT }}",
+            "embeds": [{"title": "النتايج النهائية", "color": 3066993}]
+          }'
+
+          # ملف كل حاجة
+          [ -f all-raw.txt ] && curl -F "file=@all-raw.txt" -F 'content=1. كل الصب دومينز الخام' "$DISCORD_WEBHOOK"
+          # ملف اللي بيردوا
+          [ -f alive.txt ] && curl -F "file=@alive.txt" -F 'content=2. اللي بيردوا (HTTP/S)' "$DISCORD_WEBHOOK"
+          # الملف النضيف اللي تستخدميه
+          [ -f final-clean.txt ] && curl -F "file=@final-clean.txt" -F 'content=3. **الملف النضيف النهائي - استخدم ده في أي أداة**' "$DISCORD_WEBHOOK"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MONSTER-${{ inputs.domain }}-$(date +%Y%m%d-%H%M)
+          path: |
+            all-raw.txt
+            alive.txt
+            final-clean.txt
+
+      - name: Final Boss Message
+        run: |
+          curl -X POST "$DISCORD_WEBHOOK" -d '{
+            "embeds": [{"title": "خلّصنا يا بيه", "description": "كل صب دومين موجود في الكون دلوقتي عندك\nاستمتع وكسر الدنيا", "color": 16777215}]
+          }'
