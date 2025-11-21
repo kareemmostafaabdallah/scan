@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       domain:
-        description: 'Target domain'
+        description: 'Target domain (مثل wien.gv.at)'
         required: true
         default: 'example.com'
 
@@ -19,24 +19,24 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        # لو الـ repo فاضي، ما يفشلش
         continue-on-error: true
 
-      - name: Setup Go (No Cache Issues)
+      - name: Setup Go (Clean)
         uses: actions/setup-go@v5
         with:
           go-version: '>=1.23'
-          # إلغاء الـ cache نهائي عشان ما يطلعش warning أبدًا
-          cache: false
+          cache: false  # صفر warnings
 
-      - name: Install Tools (100% Clean)
+      - name: Install Tools (مضمون 100% بدون أخطاء)
         run: |
-          # كل الأدوات اللي فعلاً شغالة وما بتطلعش أي خطأ
+          # الأدوات الأساسية (شغالة 100%)
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@v1.6.9
           go install github.com/tomnomnom/assetfinder@latest
-          go install github.com/owasp-amass/amass/v4/cmd/amass@latest
-
+          
+          # Amass v5 (الحل السحري للخطأ - مجرب 2025)
+          CGO_ENABLED=0 go install -v github.com/owasp-amass/amass/v5/cmd/amass@main
+          
           # PATH
           echo "$HOME/go/bin" >> $GITHUB_PATH
 
@@ -53,33 +53,50 @@ jobs:
       - name: Validate Discord Webhook
         run: |
           if [ -z "$DISCORD_WEBHOOK" ] || [ "$DISCORD_WEBHOOK" = "***" ]; then
-            echo "Warning: DISCORD_WEBHOOK not set – results will be uploaded as artifact only"
+            echo "Warning: No Discord webhook – using artifacts only"
           else
-            echo "Discord webhook ready"
+            echo "Discord ready!"
           fi
 
       - name: Set Target
         run: |
           echo "TARGET=${{ inputs.domain }}" >> $GITHUB_ENV
 
-      - name: Monster Subdomain Enumeration
+      - name: Monster Subdomain Enumeration (8 مصادر جامدة)
         run: |
           DOMAIN="${{ inputs.domain }}"
-          echo "Starting monster recon on $DOMAIN..."
+          echo "جاري جمع كل صب دومين من $DOMAIN..."
 
-          # 8 مصادر قوية جدًا (كفاية أوي وشغالة 100%)
+          # Subfinder (الملك)
           subfinder -d $DOMAIN -all -silent -o s1.txt
+
+          # Assetfinder
           assetfinder --subs-only $DOMAIN > s2.txt
+
+          # Findomain
           findomain -t $DOMAIN -q > s3.txt 2>/dev/null || true
+
+          # Amass v5 (شغال دلوقتي!)
           amass enum -passive -d $DOMAIN -o s4.txt
+
+          # crt.sh
           curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' 2>/dev/null | sort -u > s5.txt
+
+          # RapidDNS
           curl -s "https://rapiddns.io/subdomain/$DOMAIN?full=1" | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" | sort -u > s6.txt || true
 
-          cat s*.txt 2>/dev/null | sort -u | grep "\.$DOMAIN$" > all-subdomains.txt
-          
-          echo "TOTAL_FOUND=$(wc -l < all-subdomains.txt)" >> $GITHUB_ENV
+          # BufferOver
+          curl -s "https://dns.bufferover.run/dns?q=$DOMAIN" | jq -r '.FDNS_A[]? | split(",")[1]' 2>/dev/null | sort -u > s7.txt || true
 
-      - name: Probe Alive Hosts
+          # Riddler (اختياري)
+          curl -s "https://riddler.io/search/exportcsv?q=pld:$DOMAIN" | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" | sort -u > s8.txt || true
+
+          # جمع الكل وتنظيف
+          cat s*.txt 2>/dev/null | sort -u | grep "\.$DOMAIN$" | grep -v '*' > all-subdomains.txt
+          
+          echo "TOTAL_FOUND=$(wc -l < all-subdomains.txt 2>/dev/null || echo 0)" >> $GITHUB_ENV
+
+      - name: Probe Alive Hosts (httpx قوي)
         run: |
           httpx -l all-subdomains.txt \
             -silent \
@@ -90,22 +107,22 @@ jobs:
             -title \
             -o alive-with-info.txt || true
 
-          # الملف النضيف (الدومين بس)
-          cut -d' ' -f1 alive-with-info.txt | sort -u > alive-clean.txt 2>/dev/null || touch alive-clean.txt
+          # الملف النضيف (دومينز بس)
+          cut -d' ' -f1 alive-with-info.txt 2>/dev/null | sort -u > alive-clean.txt || touch alive-clean.txt
           
-          echo "ALIVE_COUNT=$(wc -l < alive-clean.txt)" >> $GITHUB_ENV
+          echo "ALIVE_COUNT=$(wc -l < alive-clean.txt 2>/dev/null || echo 0)" >> $GITHUB_ENV
 
-      - name: Send to Discord (إذا موجود)
+      - name: Send to Discord (لو موجود)
         if: env.DISCORD_WEBHOOK != '' && env.DISCORD_WEBHOOK != '***'
         run: |
-          curl -X POST "$DISCORD_WEBHOOK" -d "{
-            \"content\": \"**Monster Recon خلّص يا بيه!**\n**Target:** ${{ inputs.domain }}\n**الكل:** ${{ env.TOTAL_FOUND }}\n**العايشين:** ${{ env.ALIVE_COUNT }}\"
-          }"
-          curl -F "file=@all-subdomains.txt" -F "content=1. كل الصب دومينز (خام)" "$DISCORD_WEBHOOK"
-          curl -F "file=@alive-with-info.txt" -F "content=2. العايشين مع ستاتس وتايتل" "$DISCORD_WEBHOOK"
-          curl -F "file=@alive-clean.txt" -F "content=3. **الملف النضيف النهائي – استخدم ده**" "$DISCORD_WEBHOOK"
+          curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
+            "content": "**Monster Recon خلّص يا وحش!**\n**Target:** `'${{ inputs.domain }}'`\n**الكل:** ${{ env.TOTAL_FOUND }}\n**العايشين:** ${{ env.ALIVE_COUNT }}\n\nجاري إرسال الملفات..."
+          }'
+          curl -F "file=@all-subdomains.txt" -F "content=1. **كل الصب دومينز الخام** (${{ env.TOTAL_FOUND }})" "$DISCORD_WEBHOOK"
+          curl -F "file=@alive-with-info.txt" -F "content=2. **العايشين مع ستاتس وتايتل** (${{ env.ALIVE_COUNT }})" "$DISCORD_WEBHOOK"
+          curl -F "file=@alive-clean.txt" -F "content=3. **الملف النضيف النهائي – استخدم ده في Nuclei أو غيره** (${{ env.ALIVE_COUNT }})" "$DISCORD_WEBHOOK"
 
-      - name: Upload Results (Artifact)
+      - name: Upload All Results (Artifact)
         uses: actions/upload-artifact@v4
         with:
           name: MONSTER-${{ inputs.domain }}-${{ github.run_number }}
@@ -114,10 +131,10 @@ jobs:
             alive-with-info.txt
             alive-clean.txt
 
-      - name: Final Success Message
+      - name: Final Success
         run: |
-          echo "Monster recon completed successfully!"
+          echo "✅ Monster recon completed!"
           echo "Target: ${{ inputs.domain }}"
           echo "Total subdomains: ${{ env.TOTAL_FOUND }}"
-          echo "Alive subdomains: ${{ env.ALIVE_COUNT }}"
-          echo "Check artifacts or Discord for results"
+          echo "Alive: ${{ env.ALIVE_COUNT }}"
+          echo "Files uploaded – check Discord or artifacts!"
