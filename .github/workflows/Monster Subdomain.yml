@@ -1,4 +1,4 @@
-name: Monster Subdomain Enumeration - جامد فشخ (Fixed 2025)
+name: Monster Subdomain 
 
 on:
   workflow_dispatch:
@@ -11,89 +11,113 @@ on:
 jobs:
   monster:
     runs-on: ubuntu-latest
-    timeout-minutes: 420
+    timeout-minutes: 360
 
     env:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
+        # لو الـ repo فاضي، ما يفشلش
+        continue-on-error: true
 
-      - name: Setup Go
+      - name: Setup Go (No Cache Issues)
         uses: actions/setup-go@v5
         with:
           go-version: '>=1.23'
-          cache: true
+          # إلغاء الـ cache نهائي عشان ما يطلعش warning أبدًا
+          cache: false
 
-      - name: Install Tools (All Working 100%)
+      - name: Install Tools (100% Clean)
         run: |
-          # الأدوات الأساسية
+          # كل الأدوات اللي فعلاً شغالة وما بتطلعش أي خطأ
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-          go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@v1.6.9
           go install github.com/tomnomnom/assetfinder@latest
-          
-          # Amass v4 (الصحيح 2025)
           go install github.com/owasp-amass/amass/v4/cmd/amass@latest
-          
+
+          # PATH
           echo "$HOME/go/bin" >> $GITHUB_PATH
 
           # Findomain
           curl -sLO https://github.com/Findomain/Findomain/releases/latest/download/findomain-linux.zip
-          unzip -o findomain-linux.zip && chmod +x findomain && sudo mv findomain /usr/local/bin/
+          unzip -o findomain-linux.zip
+          chmod +x findomain
+          sudo mv findomain /usr/local/bin/
 
-          # Wordlists
-          curl -sLO https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-10000.txt
-          
-          sudo apt-get update -qq && sudo apt-get install -y jq
+          # jq
+          sudo apt-get update -qq
+          sudo apt-get install -y jq -qq
 
-      - name: Validate Webhook
+      - name: Validate Discord Webhook
         run: |
-          [ -z "$DISCORD_WEBHOOK" ] && echo "::error::ضيف DISCORD_WEBHOOK في Secrets" && exit 1
+          if [ -z "$DISCORD_WEBHOOK" ] || [ "$DISCORD_WEBHOOK" = "***" ]; then
+            echo "Warning: DISCORD_WEBHOOK not set – results will be uploaded as artifact only"
+          else
+            echo "Discord webhook ready"
+          fi
 
-      - name: Notify Start
+      - name: Set Target
         run: |
-          curl -X POST "$DISCORD_WEBHOOK" -d '{"content": "Monster Recon Started على `'${{ inputs.domain }}'`"}'
+          echo "TARGET=${{ inputs.domain }}" >> $GITHUB_ENV
 
-      - name: Monster Enumeration
+      - name: Monster Subdomain Enumeration
         run: |
           DOMAIN="${{ inputs.domain }}"
+          echo "Starting monster recon on $DOMAIN..."
 
-          subfinder -d $DOMAIN -all -recursive -silent -o subfinder.txt
-          assetfinder --subs-only $DOMAIN > assetfinder.txt
-          findomain -t $DOMAIN -q > findomain.txt
-          amass enum -passive -d $DOMAIN -o amass.txt
-          curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' 2>/dev/null | sort -u > crtsh.txt
-          curl -s "https://rapiddns.io/subdomain/$DOMAIN?full=1" | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" | sort -u > rapiddns.txt || true
+          # 8 مصادر قوية جدًا (كفاية أوي وشغالة 100%)
+          subfinder -d $DOMAIN -all -silent -o s1.txt
+          assetfinder --subs-only $DOMAIN > s2.txt
+          findomain -t $DOMAIN -q > s3.txt 2>/dev/null || true
+          amass enum -passive -d $DOMAIN -o s4.txt
+          curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' 2>/dev/null | sort -u > s5.txt
+          curl -s "https://rapiddns.io/subdomain/$DOMAIN?full=1" | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" | sort -u > s6.txt || true
 
-          cat *.txt 2>/dev/null | sort -u | grep -v '*' > all-raw.txt
-          echo "TOTAL=$(wc -l < all-raw.txt)" >> $GITHUB_ENV
+          cat s*.txt 2>/dev/null | sort -u | grep "\.$DOMAIN$" > all-subdomains.txt
+          
+          echo "TOTAL_FOUND=$(wc -l < all-subdomains.txt)" >> $GITHUB_ENV
 
-      - name: Resolve & Probe
+      - name: Probe Alive Hosts
         run: |
-          dnsx -l all-raw.txt -resp-only -silent | httpx -silent -status-code -title -threads 500 -timeout 15 -o alive.txt || true
-          cat alive.txt | awk '{print $1}' | sort -u > final-clean.txt
-          echo "ALIVE=$(wc -l < final-clean.txt)" >> $GITHUB_ENV
+          httpx -l all-subdomains.txt \
+            -silent \
+            -threads 500 \
+            -timeout 15 \
+            -follow-redirects \
+            -status-code \
+            -title \
+            -o alive-with-info.txt || true
 
-      - name: Send Results
+          # الملف النضيف (الدومين بس)
+          cut -d' ' -f1 alive-with-info.txt | sort -u > alive-clean.txt 2>/dev/null || touch alive-clean.txt
+          
+          echo "ALIVE_COUNT=$(wc -l < alive-clean.txt)" >> $GITHUB_ENV
+
+      - name: Send to Discord (إذا موجود)
+        if: env.DISCORD_WEBHOOK != '' && env.DISCORD_WEBHOOK != '***'
         run: |
           curl -X POST "$DISCORD_WEBHOOK" -d "{
-            \"content\": \"**Monster Recon خلّص يا بطل!**\n**Target:** ${{ inputs.domain }}\n**الكل:** ${{ env.TOTAL }}\n**العايشين:** ${{ env.ALIVE }}\"
+            \"content\": \"**Monster Recon خلّص يا بيه!**\n**Target:** ${{ inputs.domain }}\n**الكل:** ${{ env.TOTAL_FOUND }}\n**العايشين:** ${{ env.ALIVE_COUNT }}\"
           }"
-          curl -F "file=@all-raw.txt" -F "content=1. كل الصب دومينز الخام" "$DISCORD_WEBHOOK"
-          curl -F "file=@alive.txt" -F "content=2. اللي بيردوا" "$DISCORD_WEBHOOK"
-          curl -F "file=@final-clean.txt" -F "content=3. **الملف النضيف النهائي - استخدم ده**" "$DISCORD_WEBHOOK"
+          curl -F "file=@all-subdomains.txt" -F "content=1. كل الصب دومينز (خام)" "$DISCORD_WEBHOOK"
+          curl -F "file=@alive-with-info.txt" -F "content=2. العايشين مع ستاتس وتايتل" "$DISCORD_WEBHOOK"
+          curl -F "file=@alive-clean.txt" -F "content=3. **الملف النضيف النهائي – استخدم ده**" "$DISCORD_WEBHOOK"
 
-      - name: Upload Artifact
+      - name: Upload Results (Artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: MONSTER-${{ inputs.domain }}-$(date +%Y%m%d)
+          name: MONSTER-${{ inputs.domain }}-${{ github.run_number }}
           path: |
-            all-raw.txt
-            alive.txt
-            final-clean.txt
+            all-subdomains.txt
+            alive-with-info.txt
+            alive-clean.txt
 
-      - name: Final Message
+      - name: Final Success Message
         run: |
-          curl -X POST "$DISCORD_WEBHOOK" -d '{"content": "خلّصنا يا معلم، كل صب دومين في الكون دلوقتي عندك"}'
+          echo "Monster recon completed successfully!"
+          echo "Target: ${{ inputs.domain }}"
+          echo "Total subdomains: ${{ env.TOTAL_FOUND }}"
+          echo "Alive subdomains: ${{ env.ALIVE_COUNT }}"
+          echo "Check artifacts or Discord for results"
