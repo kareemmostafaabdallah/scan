@@ -1,4 +1,4 @@
-name: Monster Subdomain Enumeration - صفر أخطاء، جامد فشخ 2025
+name: Monster Subdomain Enumeration 
 
 on:
   workflow_dispatch:
@@ -25,9 +25,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '>=1.23'
-          cache: false  # صفر warnings عن go.sum
+          cache: false  # صفر warnings
 
-      - name: Install Tools (بدون Amass - شغال 100%)
+      - name: Install Tools (بدون Amass - شغال 100% مضمون)
         run: |
           # الأدوات الأساسية الجامدة (بدون أي خطأ تثبيت)
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
@@ -37,13 +37,13 @@ jobs:
           # PATH
           echo "$HOME/go/bin" >> $GITHUB_PATH
 
-          # Findomain (binary سريع)
+          # Findomain (binary سريع وشغال)
           curl -sLO https://github.com/Findomain/Findomain/releases/latest/download/findomain-linux.zip
           unzip -o findomain-linux.zip
           chmod +x findomain
           sudo mv findomain /usr/local/bin/
 
-          # jq للـ JSON
+          # jq للـ JSON parsing
           sudo apt-get update -qq
           sudo apt-get install -y jq -qq
 
@@ -59,38 +59,38 @@ jobs:
         run: |
           echo "TARGET=${{ inputs.domain }}" >> $GITHUB_ENV
 
-      - name: Monster Subdomain Enumeration (7 مصادر قوية جدًا)
+      - name: Monster Subdomain Enumeration (7 مصادر قوية جدًا - بدون Amass)
         run: |
           DOMAIN="${{ inputs.domain }}"
           echo "جاري جمع كل صب دومين من $DOMAIN..."
 
-          # Subfinder (الملك - أقوى مصدر)
+          # Subfinder (الملك - أقوى مصدر، يجيب آلاف الدومينز)
           subfinder -d $DOMAIN -all -silent -o s1.txt
 
-          # Assetfinder (سريع ودقيق)
+          # Assetfinder (سريع ودقيق، مصدر ممتاز)
           assetfinder --subs-only $DOMAIN > s2.txt
 
-          # Findomain (ممتاز للـ passive recon)
+          # Findomain (passive recon قوي جدًا)
           findomain -t $DOMAIN -q > s3.txt 2>/dev/null || true
 
-          # crt.sh (شهادات SSL - آلاف الدومينز)
+          # crt.sh (شهادات SSL - آلاف الدومينز الخفية)
           curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/^\*\.//' | sort -u > s4.txt
 
-          # RapidDNS (API قوي)
+          # RapidDNS (API قوي للدومينز الجديدة)
           curl -s "https://rapiddns.io/subdomain/$DOMAIN?full=1" | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" | sort -u > s5.txt || true
 
-          # BufferOver (DNS dumps)
+          # BufferOver (DNS dumps من الإنترنت)
           curl -s "https://dns.bufferover.run/dns?q=$DOMAIN" | jq -r '.FDNS_A[]? | split(",")[1]' 2>/dev/null | sort -u > s6.txt || true
 
-          # Riddler (اختياري، بس جامد)
+          # Riddler (بحث متقدم، جامد للدومينات الفريدة)
           curl -s "https://riddler.io/search/exportcsv?q=pld:$DOMAIN" | grep -oE "[a-zA-Z0-9._-]+\.$DOMAIN" | sort -u > s7.txt || true
 
-          # جمع الكل وتنظيف (حذف wildcards وتكرار)
+          # جمع الكل وتنظيف (حذف wildcards وتكرار، فلترة صحيحة)
           cat s*.txt 2>/dev/null | sort -u | grep "\.$DOMAIN$" | grep -v '*' > all-subdomains.txt
           
           echo "TOTAL_FOUND=$(wc -l < all-subdomains.txt 2>/dev/null || echo 0)" >> $GITHUB_ENV
 
-      - name: Probe Alive Hosts (httpx جامد)
+      - name: Probe Alive Hosts (httpx جامد - يعرف مين عايش)
         run: |
           httpx -l all-subdomains.txt \
             -silent \
@@ -102,7 +102,7 @@ jobs:
             -tech-detect \
             -o alive-with-info.txt || true
 
-          # الملف النضيف (دومينز بس، بدون إنفو)
+          # الملف النضيف (دومينز بس، بدون إنفو، للاستخدام في أدوات تانية)
           cut -d' ' -f1 alive-with-info.txt 2>/dev/null | sort -u > alive-clean.txt || touch alive-clean.txt
           
           echo "ALIVE_COUNT=$(wc -l < alive-clean.txt 2>/dev/null || echo 0)" >> $GITHUB_ENV
