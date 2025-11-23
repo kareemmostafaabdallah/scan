@@ -1,5 +1,4 @@
-name: Recon + Katana 
-
+name: Katana
 on:
   workflow_dispatch:
     inputs:
@@ -12,7 +11,6 @@ jobs:
   crawler-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 180
-
     env:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
@@ -21,109 +19,94 @@ jobs:
         uses: actions/checkout@v4
         continue-on-error: true
 
-      - name: Setup Go & Python
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: '>=1.23'
           cache: false
-        - name: Setup Python
-          uses: actions/setup-python@v5
-          with:
-            python-version: '3.12'
-            cache: false
 
-      - name: Install Tools (مضمون 100% بدون أخطاء)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Tools (صفر أخطاء)
         run: |
-          # Go tools (subfinder, httpx, katana)
+          # Go Tools
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@v1.6.9
           go install github.com/projectdiscovery/katana/cmd/katana@latest
-          
           echo "$HOME/go/bin" >> $GITHUB_PATH
 
-          # Waymore (pip install - شغال 100% من PyPI)
-          pip install waymore
-          
-          # Findomain binary
+          # Findomain
           curl -sLO https://github.com/Findomain/Findomain/releases/latest/download/findomain-linux.zip
           unzip -o findomain-linux.zip
           chmod +x findomain
           sudo mv findomain /usr/local/bin/
 
-          # jq للـ JSON
+          # Waymore (Python)
+          pip install waymore --quiet
+
+          # jq
           sudo apt-get update -qq
           sudo apt-get install -y jq -qq
 
-      - name: Notify Start
+      - name: Start Notification
         if: env.DISCORD_WEBHOOK != ''
         run: |
-          curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
-            "content": "**Crawler Scan بدأ على** `'${{ inputs.domain }}'`\nجاري جمع subdomains → alive → katana → waymore... (نتايج في 60 دقيقة)"
+          curl -X POST "$DISCORD_WEBHOOK" -d '{
+            "content": "**بدأنا الكرولر على** `'${{ inputs.domain }}'`\nجاري جمع subdomains → alive → katana → waymore... (هيخلّص في ساعة تقريبًا)"
           }'
 
-      - name: Collect Subdomains (5 مصادر قوية)
+      - name: Subdomain Enumeration
         run: |
           DOMAIN="${{ inputs.domain }}"
-          
-          subfinder -d $DOMAIN -all -silent -o subdomains.txt
-          assetfinder --subs-only $DOMAIN >> subdomains.txt
-          findomain -t $DOMAIN -q >> subdomains.txt 2>/dev/null || true
-          curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/^\*\.//' | sort -u >> subdomains.txt
-          curl -s "https://dns.bufferover.run/dns?q=$DOMAIN" | jq -r '.FDNS_A[]? | split(",")[1]' 2>/dev/null | sort -u >> subdomains.txt || true
-          
-          sort -u subdomains.txt -o subdomains.txt
-          TOTAL_SUBS=$(wc -l < subdomains.txt 2>/dev/null || echo 0)
-          echo "TOTAL_SUBS=$TOTAL_SUBS" >> $GITHUB_ENV
+          subfinder -d $DOMAIN -all -silent -o s1.txt
+          assetfinder --subs-only $DOMAIN > s2.txt 2>/dev/null || true
+          findomain -t $DOMAIN -q > s3.txt 2>/dev/null || true
+          curl -s "https://crt.sh/?q=%25.$DOMAIN&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/^\*\.//' | sort -u > s4.txt
+          cat s*.txt 2>/dev/null | sort -u | grep -E "^[a-zA-Z0-9]" > all-subdomains.txt
+          echo "SUBS=$(wc -l < all-subdomains.txt)" >> $GITHUB_ENV
 
       - name: Probe Alive Hosts
         run: |
-          httpx -l subdomains.txt \
-            -silent -threads 500 -timeout 15 -follow-redirects \
-            -status-code -title -tech-detect \
-            -o alive.txt || true
-          
-          cut -d' ' -f1 alive.txt | sort -u > alive-clean.txt
-          ALIVE=$(wc -l < alive-clean.txt 2>/dev/null || echo 0)
-          echo "ALIVE_HOSTS=$ALIVE" >> $GITHUB_ENV
+          httpx -l all-subdomains.txt -silent -threads 500 -timeout 15 -follow-redirects -status-code -title -o alive-full.txt || true
+          cut -d' ' -f1 alive-full.txt | sort -u > alive.txt
+          echo "ALIVE=$(wc -l < alive.txt)" >> $GITHUB_ENV
 
-      - name: Run Katana Crawler (على الـ alive hosts)
+      - name: Katana Crawling
         run: |
-          cat alive-clean.txt | katana -silent -c 50 -d 3 -jc -kf all -o katana-urls.txt || true
-          KATANA_COUNT=$(wc -l < katana-urls.txt 2>/dev/null || echo 0)
-          echo "KATANA_URLS=$KATANA_COUNT" >> $GITHUB_ENV
+          cat alive.txt | katana -silent -c 50 -d 5 -jc -o katana.txt || true
+          echo "KATANA=$(wc -l < katana.txt || echo 0)" >> $GITHUB_ENV
 
-      - name: Run Waymore (على الـ alive hosts للـ archives)
+      - name: Waymore (Archives + APIs)
         run: |
-          cat alive-clean.txt | waymore -i - -o waymore-urls.txt -f waymore.txt || true
-          WAYMORE_COUNT=$(wc -l < waymore-urls.txt 2>/dev/null || echo 0)
-          echo "WAYMORE_URLS=$WAYMORE_COUNT" >> $GITHUB_ENV
+          cat alive.txt | waymore -i - -o waymore.txt || true
+          echo "WAYMORE=$(wc -l < waymore.txt || echo 0)" >> $GITHUB_ENV
 
       - name: Send Results to Discord
         if: env.DISCORD_WEBHOOK != ''
         run: |
-          curl -X POST -H "Content-Type: application/json" "$DISCORD_WEBHOOK" -d '{
-            "content": "**Crawler Scan خلّص يا وحش!**\n**Target:** `'${{ inputs.domain }}'`\n**Subdomains:** ${{ env.TOTAL_SUBS }}\n**Alive Hosts:** ${{ env.ALIVE_HOSTS }}\n**Katana URLs:** ${{ env.KATANA_URLS }}\n**Waymore URLs:** ${{ env.WAYMORE_URLS }}\n\nجاري إرسال 5 ملفات نضيفة...",
-            "embeds": [{"title": "نتايج جامدة فشخ", "color": 3066993}]
-          }'
-          curl -F "file=@subdomains.txt" -F "content=1. **كل الصب دومينز** (${{ env.TOTAL_SUBS }})" "$DISCORD_WEBHOOK"
-          curl -F "file=@alive.txt" -F "content=2. **الـ Alive مع إنفو** (${{ env.ALIVE_HOSTS }})" "$DISCORD_WEBHOOK"
-          curl -F "file=@alive-clean.txt" -F "content=3. **الـ Alive النضيف**" "$DISCORD_WEBHOOK"
-          curl -F "file=@katana-urls.txt" -F "content=4. **Katana Crawled URLs** (${{ env.KATANA_URLS }})" "$DISCORD_WEBHOOK"
-          curl -F "file=@waymore-urls.txt" -F "content=5. **Waymore Archive URLs** (${{ env.WAYMORE_URLS }})" "$DISCORD_WEBHOOK"
+          curl -X POST "$DISCORD_WEBHOOK" -d "{
+            \"content\": \"**خلّصنا يا معلم!**\n**Target:** ${{ inputs.domain }}\n**Subdomains:** ${{ env.SUBS }}\n**Alive:** ${{ env.ALIVE }}\n**Katana URLs:** ${{ env.KATANA }}\n**Waymore URLs:** ${{ env.WAYMORE }}\"
+          }"
+          curl -F "file=@all-subdomains.txt" -F "content=1. كل الصب دومينز" "$DISCORD_WEBHOOK"
+          curl -F "file=@alive-full.txt"   -F "content=2. Alive مع إنفو" "$DISCORD_WEBHOOK"
+          curl -F "file=@alive.txt"        -F "content=3. Alive نضيف" "$DISCORD_WEBHOOK"
+          curl -F "file=@katana.txt"       -F "content=4. Katana URLs" "$DISCORD_WEBHOOK"
+          curl -F "file=@waymore.txt"      -F "content=5. Waymore URLs" "$DISCORD_WEBHOOK"
 
-      - name: Upload All Artifacts
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: CRAWLER-${{ inputs.domain }}-${{ github.run_number }}
+          name: RECON-${{ inputs.domain }}-${{ github.run_number }}
           path: |
-            subdomains.txt
+            all-subdomains.txt
+            alive-full.txt
             alive.txt
-            alive-clean.txt
-            katana-urls.txt
-            waymore-urls.txt
+            katana.txt
+            waymore.txt
 
-      - name: Final Success
+      - name: Done
         run: |
-          echo "✅ Crawler Scan completed – صفر أخطاء!"
-          echo "Subdomains: ${{ env.TOTAL_SUBS }} | Alive: ${{ env.ALIVE_HOSTS }} | Katana: ${{ env.KATANA_URLS }} | Waymore: ${{ env.WAYMORE_URLS }}"
-          [ -n "$DISCORD_WEBHOOK" ] && curl -X POST "$DISCORD_WEBHOOK" -d '{"content": "تمام يا معلم، كل الـ URLs جاهزة للكسر! 🔥"}'
+          [ -n "$DISCORD_WEBHOOK" ] && curl -X POST "$DISCORD_WEBHOOK" -d '{"content": "تمام التمام يا بطل – كل الـ URLs عندك دلوقتي!"}'
